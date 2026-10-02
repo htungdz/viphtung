@@ -437,7 +437,7 @@ def _create_shared_prediction(board, rows):
     with sqlite3.connect(DB_PATH) as db:
         prev=db.execute('SELECT last_completed_session FROM board_cursor WHERE board=?',(board,)).fetchone()
         pn=_session_num(prev[0]) if prev else None; cn=_session_num(latest)
-        if pn is not None and cn is not None and (cn<pn or cn>pn+12):
+        if pn is not None and cn is not None and cn<pn:
             return get_shared_prediction(board),False
         db.execute('''INSERT INTO board_cursor(board,last_completed_session,updated_at) VALUES(?,?,?)
                       ON CONFLICT(board) DO UPDATE SET last_completed_session=excluded.last_completed_session,
@@ -482,7 +482,7 @@ async def set_state(board, ok, error=None):
 
 
 async def fetch_json(client,url):
-    r=await client.get(url,headers={'Accept':'application/json','Cache-Control':'no-cache'},timeout=3.5)
+    r=await client.get(url,headers={'Accept':'application/json','Cache-Control':'no-cache'},timeout=2.0)
     r.raise_for_status(); return r.json()
 
 
