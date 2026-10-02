@@ -83,6 +83,9 @@ def ensure_db():
             message_id INTEGER NOT NULL, created_at REAL NOT NULL,
             PRIMARY KEY(chat_id,board)
         )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS board_cursor(
+            board TEXT PRIMARY KEY, last_completed_session TEXT, updated_at REAL NOT NULL
+        )''')
         db.commit()
 
 
@@ -193,11 +196,27 @@ def _entropy(seq):
     return -p*math.log2(p)-(1-p)*math.log2(1-p)
 
 
+def _session_num(v):
+    m=re.search(r'(\d+)(?!.*\d)',str(v)) if v is not None else None
+    try: return int(m.group(1)) if m else None
+    except: return None
+
+def _stable_rows(rows):
+    u={str(r.get('id')):r for r in rows if r.get('id') is not None}
+    nums=sorted([r for r in u.values() if _session_num(r.get('id')) is not None],key=lambda r:_session_num(r['id']))
+    if len(nums)>=4:
+        groups=[]; g=[nums[0]]
+        for r in nums[1:]:
+            if _session_num(r['id'])-_session_num(g[-1]['id'])<=12:g.append(r)
+            else:groups.append(g);g=[r]
+        groups.append(g)
+        best=max(groups,key=lambda x:(len(x),_session_num(x[-1]['id'])))
+        if len(best)>=3: nums=best
+    return nums
+
 def _next_session(rows):
-    if not rows: return None
-    last=str(rows[-1]['id'])
-    try: return str(int(last)+1)
-    except: return last+'+1'
+    s=_stable_rows(rows)
+    return str(_session_num(s[-1]['id'])+1) if s else None
 
 
 def model_snapshot(rows, game=None):
@@ -205,7 +224,7 @@ def model_snapshot(rows, game=None):
     if len(seq)<6:
         return {'sample':len(seq),'score':0.0,'prediction':None,'confidence':50,'percent':50,
                 'pattern':'ĐANG HỌC','alt':'Chưa đủ mẫu','entropy':round(_entropy(seq),4),
-                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'SHARED ADAPTIVE V17',
+                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'SHARED ADAPTIVE V19',
                 'skills':0,'totalSkills':16,'updated_at':time.time()}
     vote=lambda x: 1 if x=='TÀI' else -1
     n=len(seq)
@@ -335,7 +354,7 @@ def model_snapshot(rows, game=None):
     return {'sample':n,'score':round(score,4),'prediction':pred,'confidence':conf,'percent':conf,
             'run':run,'pattern':pattern,'alt':alt,'entropy':round(H,4),
             'cycle':{'k':lag,'r':round(best,4)},'agreement':round(agreement,4),
-            'engine':'SHARED ADAPTIVE V17','skills':len(active),'totalSkills':16,
+            'engine':'SHARED ADAPTIVE V19','skills':len(active),'totalSkills':16,
             'updated_at':time.time()}
 
 
@@ -357,12 +376,11 @@ async def store_rows(board, rows):
 
 def load_rows(board, limit=500):
     with sqlite3.connect(DB_PATH) as db:
-        cur=db.execute('SELECT session,result,d1,d2,d3,total,md5,seen_at FROM rounds WHERE board=? ORDER BY seen_at DESC LIMIT ?',(board,limit))
         rows=[]
-        for s,r,d1,d2,d3,total,md5,seen in reversed(cur.fetchall()):
-            dice=[x for x in (d1,d2,d3) if x is not None]
-            rows.append({'id':s,'result':r,'dice':dice,'sum':total,'md5':md5,'seen_at':seen})
-        return rows
+        for s,r,d1,d2,d3,total,md5,seen in db.execute('SELECT session,result,d1,d2,d3,total,md5,seen_at FROM rounds WHERE board=?',(board,)):
+            rows.append({'id':str(s),'result':r,'dice':[x for x in (d1,d2,d3) if x is not None],
+                         'sum':total,'md5':md5,'seen_at':seen})
+        return _stable_rows(rows)[-limit:]
 
 
 def get_prediction_history(board, limit=20):
@@ -415,6 +433,15 @@ def _create_shared_prediction(board, rows):
     if not model.get('prediction'): return None,False
     session=_next_session(rows)
     if not session: return None,False
+    latest=str(int(session)-1)
+    with sqlite3.connect(DB_PATH) as db:
+        prev=db.execute('SELECT last_completed_session FROM board_cursor WHERE board=?',(board,)).fetchone()
+        pn=_session_num(prev[0]) if prev else None; cn=_session_num(latest)
+        if pn is not None and cn is not None and (cn<pn or cn>pn+12):
+            return get_shared_prediction(board),False
+        db.execute('''INSERT INTO board_cursor(board,last_completed_session,updated_at) VALUES(?,?,?)
+                      ON CONFLICT(board) DO UPDATE SET last_completed_session=excluded.last_completed_session,
+                      updated_at=excluded.updated_at''',(board,latest,time.time())); db.commit()
     with sqlite3.connect(DB_PATH) as db:
         old=db.execute('SELECT prediction,confidence,score,model_json,created_at,actual,ok,settled_at FROM shared_predictions WHERE board=? AND session=?',(board,session)).fetchone()
         if old:
@@ -725,7 +752,7 @@ app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_credentials=False,al
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'engine':'SHARED ADAPTIVE V17'}
+    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'engine':'SHARED ADAPTIVE V19'}
 
 @app.get('/api/learn/{game}/{table}')
 def learn(game:str, table:str, limit:int=Query(500,ge=20,le=800), sub:str|None=None):
