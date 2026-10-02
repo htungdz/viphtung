@@ -78,6 +78,11 @@ def ensure_db():
         db.execute('''CREATE TABLE IF NOT EXISTS bot_chat_state(
             chat_id INTEGER PRIMARY KEY, selected_board TEXT
         )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS bot_auto_messages(
+            chat_id INTEGER NOT NULL, board TEXT NOT NULL, session TEXT NOT NULL,
+            message_id INTEGER NOT NULL, created_at REAL NOT NULL,
+            PRIMARY KEY(chat_id,board)
+        )''')
         db.commit()
 
 
@@ -362,14 +367,19 @@ def load_rows(board, limit=500):
 
 def get_prediction_history(board, limit=20):
     with sqlite3.connect(DB_PATH) as db:
-        cur=db.execute('''SELECT session,prediction,confidence,score,created_at,actual,ok,settled_at,model_json
-                          FROM shared_predictions WHERE board=? ORDER BY created_at DESC LIMIT ?''',(board,limit))
+        cur=db.execute('''SELECT p.session,p.prediction,p.confidence,p.score,p.created_at,p.actual,p.ok,p.settled_at,p.model_json,
+                                 r.d1,r.d2,r.d3,r.total,r.md5
+                          FROM shared_predictions p
+                          LEFT JOIN rounds r ON r.board=p.board AND r.session=p.session
+                          WHERE p.board=? ORDER BY p.created_at DESC LIMIT ?''',(board,limit))
         out=[]
-        for session,pred,conf,score,created,actual,ok,settled,mj in cur.fetchall():
+        for session,pred,conf,score,created,actual,ok,settled,mj,d1,d2,d3,total,md5 in cur.fetchall():
             try: model=json.loads(mj) if mj else {}
             except: model={}
+            dice=[x for x in (d1,d2,d3) if x is not None]
             out.append({'session':session,'prediction':pred,'confidence':conf,'score':score,'created_at':created,
-                        'actual':actual,'ok':None if ok is None else bool(ok),'settled_at':settled,'model':model})
+                        'actual':actual,'ok':None if ok is None else bool(ok),'settled_at':settled,'model':model,
+                        'dice':dice,'sum':total,'md5':md5})
         return out
 
 
@@ -382,16 +392,20 @@ def get_shared_prediction(board):
 
 def _settle_predictions(board, rows):
     actual={str(r['id']):r['result'] for r in rows if r.get('result') in ('TÀI','XỈU')}
-    if not actual: return
+    if not actual: return []
+    settled=[]
     with sqlite3.connect(DB_PATH) as db:
         pend=db.execute('SELECT session,prediction FROM shared_predictions WHERE board=? AND actual IS NULL',(board,)).fetchall()
         now=time.time()
         for session,pred in pend:
             if str(session) not in actual: continue
             act=actual[str(session)]
+            ok=1 if pred==act else 0
             db.execute('UPDATE shared_predictions SET actual=?,ok=?,settled_at=? WHERE board=? AND session=?',
-                       (act,1 if pred==act else 0,now,board,str(session)))
+                       (act,ok,now,board,str(session)))
+            settled.append({'session':str(session),'prediction':pred,'actual':act,'ok':bool(ok)})
         db.commit()
+    return settled
 
 
 def _create_shared_prediction(board, rows):
@@ -418,7 +432,10 @@ def _create_shared_prediction(board, rows):
 
 async def refresh_shared_prediction(board):
     rows=load_rows(board,MAX_HISTORY)
-    _settle_predictions(board,rows)
+    settled=_settle_predictions(board,rows)
+    if settled and BOT_TOKEN:
+        for item in settled:
+            asyncio.create_task(bot_clear_settled_prediction(board,item['session']))
     pred,created=_create_shared_prediction(board,rows)
     if created and BOT_TOKEN:
         asyncio.create_task(bot_notify_prediction(board,pred))
@@ -544,24 +561,19 @@ def bot_games_keyboard(chat_id):
 
 def bot_board_keyboard(board):
     return {'inline_keyboard':[
-      [{'text':'🔔 BẬT AUTO','callback_data':'on|'+board},{'text':'🔕 TẮT AUTO','callback_data':'off|'+board}],
-      [{'text':'🎯 DỰ ĐOÁN','callback_data':'now|'+board},{'text':'📜 LỊCH SỬ','callback_data':'hist|'+board}],
-      [{'text':'⬅️ CHỌN GAME','callback_data':'games'}]
+      [{'text':'▶️ AUTO','callback_data':'on|'+board},{'text':'⏹ TẮT','callback_data':'off|'+board}],
+      [{'text':'🎯 XEM','callback_data':'now|'+board},{'text':'📜 LS','callback_data':'hist|'+board},{'text':'🎮 GAME','callback_data':'games'}]
     ]}
 
 
 def format_prediction(board,pred):
-    if not pred: return f'🎮 {board_label(board)}\n⏳ Chưa đủ dữ liệu để tạo dự đoán chung.'
+    if not pred: return f'🎮 {board_label(board)} · ⏳ Chưa đủ dữ liệu'
     m=pred.get('model') or {}
     side=display_pred(board,pred.get('prediction'))
-    return (f'🎮 {board_label(board)}\n'
-            f'🔢 Phiên dự đoán: #{pred.get("session","---")}\n'
-            f'🎯 Dự đoán chung WEB ↔ BOT: {side}\n'
-            f'📶 Độ mạnh tín hiệu: {pred.get("confidence",50)}%\n'
-            f'🧠 Engine: {m.get("engine","SHARED ADAPTIVE V17")}\n'
-            f'📚 Mẫu học: {m.get("sample",0)} phiên · {m.get("pattern","---")}\n'
-            f'🤝 Đồng thuận: {round(float(m.get("agreement",0))*100)}%\n\n'
-            f'Đây là tín hiệu thống kê, không phải xác suất chắc thắng.')
+    return (f'🎮 {board_label(board)}  ·  #{pred.get("session","---")}\n'
+            f'🎯 {side}  ·  📶 {pred.get("confidence",50)}%\n'
+            f'🧠 {m.get("pattern","SHARED")}  ·  🤝 {round(float(m.get("agreement",0))*100)}%\n'
+            f'📚 {m.get("sample",0)} phiên')
 
 
 def format_history(board,limit=12):
@@ -600,9 +612,38 @@ async def bot_notify_prediction(board,pred):
     if not pred: return
     chats=all_subscribers(board)
     if not chats: return
-    text='🔔 DỰ ĐOÁN MỚI TỪ ENGINE CHUNG 24/7\n\n'+format_prediction(board,pred)
-    for chat in chats:
-        await tg_send(chat,text,bot_board_keyboard(board))
+    text='🔔 AUTO · '+format_prediction(board,pred)
+    async with httpx.AsyncClient() as c:
+        for chat in chats:
+            try:
+                old=None
+                with sqlite3.connect(DB_PATH) as db:
+                    old=db.execute('SELECT message_id FROM bot_auto_messages WHERE chat_id=? AND board=?',(chat,board)).fetchone()
+                if old:
+                    try: await tg_call(c,'deleteMessage',{'chat_id':chat,'message_id':old[0]})
+                    except: pass
+                msg=await tg_call(c,'sendMessage',{'chat_id':chat,'text':text,'disable_web_page_preview':True,'reply_markup':bot_board_keyboard(board)})
+                if msg and msg.get('message_id'):
+                    with sqlite3.connect(DB_PATH) as db:
+                        db.execute('''INSERT INTO bot_auto_messages(chat_id,board,session,message_id,created_at)
+                                      VALUES(?,?,?,?,?) ON CONFLICT(chat_id,board) DO UPDATE SET
+                                      session=excluded.session,message_id=excluded.message_id,created_at=excluded.created_at''',
+                                   (chat,board,str(pred.get('session','')),int(msg['message_id']),time.time()))
+                        db.commit()
+            except Exception:
+                pass
+
+
+async def bot_clear_settled_prediction(board,session):
+    async with httpx.AsyncClient() as c:
+        with sqlite3.connect(DB_PATH) as db:
+            rows=db.execute('SELECT chat_id,message_id FROM bot_auto_messages WHERE board=? AND session=?',(board,str(session))).fetchall()
+        for chat,message_id in rows:
+            try: await tg_call(c,'deleteMessage',{'chat_id':chat,'message_id':message_id})
+            except: pass
+        if rows:
+            with sqlite3.connect(DB_PATH) as db:
+                db.execute('DELETE FROM bot_auto_messages WHERE board=? AND session=?',(board,str(session)));db.commit()
 
 
 async def bot_handle_message(client,msg):
