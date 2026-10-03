@@ -70,6 +70,7 @@ _db_lock = asyncio.Lock()
 _worker_task = None
 _bot_task = None
 _last_cycle = 0.0
+_ml_cache = {}
 
 
 def ensure_db():
@@ -190,7 +191,19 @@ def parse_tx(data):
         if not isinstance(o,dict): continue
         d=dice_values(o); t=total_value(o,d); r=tx_result(o,d,t)
         if not r: continue
-        out.append({'id':str(sid(o,i+1)),'result':r,'dice':d,'sum':t,'md5':pick(o,['md5','hash','md5_hash','md5Hash','hash_md5','md5Code','md5_code','md5_result','md5_enc','md5_dec'])})
+        meta={
+            'total_tai':pick(o,['total_tai','tong_tai','tai_total','totalTai']),
+            'total_xiu':pick(o,['total_xiu','tong_xiu','xiu_total','totalXiu']),
+            'jackpot':pick(o,['jackpot','hu','pot']),
+            'raw_rs':pick(o,['raw_rS','raw_rs','raw']),
+            'cbb':pick(o,['CBB','cbb']),
+            'gbb':pick(o,['gBB','gbb']),
+            'i':pick(o,['i'])
+        }
+        meta={k:v for k,v in meta.items() if v is not None}
+        out.append({'id':str(sid(o,i+1)),'result':r,'dice':d,'sum':t,
+                    'md5':pick(o,['md5','hash','md5_hash','md5Hash','hash_md5','md5Code','md5_code','md5_result','md5_enc','md5_dec']),
+                    'meta':meta or None})
     def key(x):
         try: return (0,int(x['id']))
         except: return (1,x['id'])
@@ -227,43 +240,62 @@ def parse_xocdia(data):
 
 
 def dice_position_forecast(rows):
-    valid=[r for r in rows[-500:] if isinstance(r.get('dice'),list) and len(r.get('dice'))>=3]
-    if len(valid)<8: return {'ready':False,'sample':len(valid),'faces':[]}
+    valid=[r for r in rows[-700:] if isinstance(r.get('dice'),list) and len(r.get('dice'))>=3]
+    if len(valid)<12:return {'ready':False,'sample':len(valid),'faces':[]}
     faces=[]
     for j in range(3):
-        last=int(valid[-1]['dice'][j]); scores={k:1.2 for k in range(1,7)}
-        # recency-weighted face frequency
+        last=int(valid[-1]['dice'][j]);prev2=tuple(int(r['dice'][j]) for r in valid[-2:])
+        scores={k:1.8 for k in range(1,7)}
         for idx,r in enumerate(valid):
             try:v=int(r['dice'][j])
             except:continue
-            age=len(valid)-1-idx; scores[v]+=0.5**(age/44)
-        # transition conditioned on the last face
+            age=len(valid)-1-idx;scores[v]+=0.5**(age/46)
+        # order-1 transition
         for idx in range(1,len(valid)):
-            try:prev=int(valid[idx-1]['dice'][j]); nxt=int(valid[idx]['dice'][j])
+            try:prev=int(valid[idx-1]['dice'][j]);nxt=int(valid[idx]['dice'][j])
             except:continue
             if prev==last:
-                age=len(valid)-1-idx; scores[nxt]+=1.45*(0.5**(age/36))
+                age=len(valid)-1-idx;scores[nxt]+=1.45*(0.5**(age/38))
+        # order-2 position motif
+        for idx in range(2,len(valid)):
+            try:ctx=(int(valid[idx-2]['dice'][j]),int(valid[idx-1]['dice'][j]));nxt=int(valid[idx]['dice'][j])
+            except:continue
+            if ctx==prev2:
+                age=len(valid)-1-idx;scores[nxt]+=1.15*(0.5**(age/44))
+        total_score=sum(scores.values())
         ordered=sorted(scores.items(),key=lambda kv:kv[1],reverse=True)
         top,second=ordered[0],ordered[1]
         strength=(top[1]-second[1])/max(.001,top[1]+second[1])
-        faces.append({'position':j+1,'face':top[0],'strength':round(strength,3)})
-    total=sum(x['face'] for x in faces)
-    zone='3–8' if total<=8 else '9–10' if total<=10 else '11–12' if total<=12 else '13–18'
-    return {'ready':True,'sample':len(valid),'faces':faces,'estimated_total':total,'sum_zone':zone}
+        faces.append({'position':j+1,'face':top[0],'strength':round(strength,3),
+                      'probability':round(top[1]/total_score,3),
+                      'top3':[{'face':f,'p':round(sc/total_score,3)} for f,sc in ordered[:3]]})
+    est=sum(x['face'] for x in faces)
+    zone='3–8' if est<=8 else '9–10' if est<=10 else '11–12' if est<=12 else '13–18'
+    return {'ready':True,'sample':len(valid),'faces':faces,'estimated_total':est,'sum_zone':zone}
 
 
 def xocdia_detail_forecast(rows, binary_prediction):
     want_even=(binary_prediction=='TÀI')
-    scores={k:1.0 for k in range(5) if (k%2==0)==want_even}
-    sample=0
-    for idx,r in enumerate(rows[-500:]):
-        meta=r.get('meta') or {}
-        red=meta.get('red_count')
-        if not isinstance(red,int) or red not in scores: continue
-        age=min(120,len(rows)-1-idx); scores[red]+=0.5**(age/42); sample+=1
+    allowed=[k for k in range(5) if (k%2==0)==want_even]
+    scores={k:1.4 for k in allowed}
+    valid=[]
+    for r in rows[-700:]:
+        meta=r.get('meta') or {};red=meta.get('red_count')
+        if isinstance(red,int) and 0<=red<=4:valid.append(red)
+    for idx,red in enumerate(valid):
+        if red not in scores:continue
+        age=len(valid)-1-idx;scores[red]+=0.5**(age/44)
+    # transition conditioned on the last observed red-count
+    if valid:
+        last=valid[-1]
+        for i in range(1,len(valid)):
+            if valid[i-1]==last and valid[i] in scores:
+                age=len(valid)-1-i;scores[valid[i]]+=1.25*(0.5**(age/40))
     if not scores:return None
-    best=max(scores,key=scores.get)
-    return {'red_count':best,'white_count':4-best,'label':f'{best} Đỏ · {4-best} Trắng','sample':sample}
+    total=sum(scores.values());best=max(scores,key=scores.get)
+    return {'red_count':best,'white_count':4-best,'label':f'{best} Đỏ · {4-best} Trắng',
+            'sample':len(valid),'probability':round(scores[best]/max(.001,total),3)}
+
 
 def parse_baccarat(data):
     rows = data if isinstance(data,list) else (data.get('predictions',[]) if isinstance(data,dict) else [])
@@ -318,21 +350,158 @@ def _next_session(rows):
     return str(_session_num(s[-1]['id'])+1) if s else None
 
 
-def model_snapshot(rows, game=None):
+
+def _sigmoid(z):
+    z=_clamp(float(z),-18.0,18.0)
+    return 1.0/(1.0+math.exp(-z))
+
+
+def _ml_feature(valid, upto):
+    """Features computed only from rows before `upto`, so training never peeks at the target."""
+    if upto < 12: return None
+    hist=valid[:upto]
+    seq=[1 if r.get('result')=='TÀI' else -1 for r in hist]
+    f=[1.0]
+    # last 5 binary outcomes
+    for k in range(1,6):
+        f.append(float(seq[-k]) if len(seq)>=k else 0.0)
+    # multi-window balances
+    for w in (6,12,24,48):
+        q=seq[-w:]
+        f.append(sum(q)/max(1,len(q)))
+    # signed run length
+    run=1
+    for j in range(len(seq)-2,-1,-1):
+        if seq[j]==seq[-1] and run<8: run+=1
+        else: break
+    f.append(seq[-1]*run/8.0)
+    # flip rate
+    q=seq[-16:]
+    fr=sum(1 for j in range(1,len(q)) if q[j]!=q[j-1])/max(1,len(q)-1)
+    f.append((fr-.5)*2.0)
+    # transition conditioned on last state, Laplace-smoothed
+    p=x=1.5
+    for j in range(1,len(seq)):
+        if seq[j-1]!=seq[-1]: continue
+        if seq[j]>0:p+=1
+        else:x+=1
+    f.append((p-x)/(p+x))
+    # order-2 context
+    p=x=1.5
+    if len(seq)>=3:
+        ctx=tuple(seq[-2:])
+        for j in range(2,len(seq)):
+            if tuple(seq[j-2:j])!=ctx: continue
+            if seq[j]>0:p+=1
+            else:x+=1
+    f.append((p-x)/(p+x))
+    # entropy / regime
+    raw=['TÀI' if v>0 else 'XỈU' for v in seq[-36:]]
+    f.append((.5-_entropy(raw))*2.0)
+    # dice/sum state
+    last=hist[-1]
+    sm=last.get('sum')
+    f.append(_clamp(((float(sm)-10.5)/7.5) if isinstance(sm,(int,float)) else 0.0,-1,1))
+    sums=[r.get('sum') for r in hist[-10:] if isinstance(r.get('sum'),(int,float))]
+    f.append(_clamp(((sum(sums)/len(sums)-10.5)/5.0) if sums else 0.0,-1,1))
+    if len(sums)>=2: f.append(_clamp((sums[-1]-sums[-2])/8.0,-1,1))
+    else: f.append(0.0)
+    d=last.get('dice') or []
+    if len(d)>=3:
+        f.append((sum(1 for v in d[:3] if int(v)>=4)-1.5)/1.5)
+        f.append((sum(1 for v in d[:3] if int(v)%2==0)-1.5)/1.5)
+        pair=len(set(int(v) for v in d[:3]))
+        f.append(1.0 if pair==1 else .35 if pair==2 else -.35)
+    else:
+        f.extend([0.0,0.0,0.0])
+    # optional crowd-flow feature; low influence and only when source exposes both totals
+    meta=last.get('meta') or {}
+    try:
+        tt=float(meta.get('total_tai')); tx=float(meta.get('total_xiu'))
+        f.append(_clamp((tt-tx)/max(1.0,tt+tx),-1,1))
+    except:
+        f.append(0.0)
+    return f
+
+
+def _online_ml_signal(rows, board=None):
+    valid=[r for r in rows[-560:] if r.get('result') in ('TÀI','XỈU')]
+    if len(valid)<70:
+        return {'ready':False,'sample':max(0,len(valid)-12),'score':0.0,'p_tai':.5,'val_accuracy':.5,'brier':.25}
+    last_id=str(valid[-1].get('id'))
+    cache_key=(board or '',last_id,len(valid))
+    if board and cache_key in _ml_cache:
+        return _ml_cache[cache_key]
+    samples=[]
+    for i in range(12,len(valid)):
+        x=_ml_feature(valid,i)
+        if x is None: continue
+        y=1.0 if valid[i].get('result')=='TÀI' else 0.0
+        samples.append((x,y))
+    if len(samples)<45:
+        res={'ready':False,'sample':len(samples),'score':0.0,'p_tai':.5,'val_accuracy':.5,'brier':.25}
+        if board:_ml_cache[cache_key]=res
+        return res
+    cut=max(30,min(len(samples)-12,int(len(samples)*.76)))
+    train=samples[:cut]; val=samples[cut:]
+    dim=len(train[0][0]); w=[0.0]*dim
+    # SGD with L2 and recency emphasis
+    for ep in range(5):
+        lr=.050/(1.0+ep*.38)
+        L=max(1,len(train))
+        for idx,(x,y) in enumerate(train):
+            p=_sigmoid(sum(a*b for a,b in zip(w,x)))
+            rw=.35+.65*((idx+1)/L)
+            err=(y-p)*rw
+            for j in range(dim):
+                reg=.0025*w[j] if j else 0.0
+                w[j]+=lr*(err*x[j]-reg)
+    correct=0; brier=0.0
+    for x,y in val:
+        p=_sigmoid(sum(a*b for a,b in zip(w,x)))
+        correct += int((p>=.5)==(y>=.5))
+        brier += (p-y)**2
+    acc=correct/max(1,len(val)); brier/=max(1,len(val))
+    # train the final model on all known samples after validation is measured
+    for ep in range(2):
+        lr=.025/(1+ep*.4); L=max(1,len(samples))
+        for idx,(x,y) in enumerate(samples):
+            p=_sigmoid(sum(a*b for a,b in zip(w,x)))
+            rw=.45+.55*((idx+1)/L); err=(y-p)*rw
+            for j in range(dim):
+                reg=.002*w[j] if j else 0.0
+                w[j]+=lr*(err*x[j]-reg)
+    cur=_ml_feature(valid,len(valid))
+    p=_sigmoid(sum(a*b for a,b in zip(w,cur)))
+    reliability=_clamp(.08+max(0,acc-.50)*2.6+max(0,.25-brier)*1.7,.08,.72)
+    # if validation is below chance, strongly shrink rather than invert/overfit.
+    if acc<.49 and brier>=.25: reliability*=.45
+    strength=(p-.5)*2.0*reliability
+    res={'ready':True,'sample':len(samples),'validation':len(val),'p_tai':round(p,4),
+         'val_accuracy':round(acc,4),'brier':round(brier,4),'reliability':round(reliability,4),
+         'score':round(_clamp(strength,-.58,.58),4)}
+    if board:
+        # keep only the newest cache for this board
+        for k in list(_ml_cache):
+            if k[0]==board and k!=cache_key:_ml_cache.pop(k,None)
+        _ml_cache[cache_key]=res
+    return res
+
+
+def model_snapshot(rows, game=None, board=None):
     seq=[r['result'] for r in rows if r.get('result') in ('TÀI','XỈU')]
     if len(seq)<6:
         return {'sample':len(seq),'score':0.0,'prediction':None,'confidence':50,'percent':50,
                 'pattern':'ĐANG HỌC','alt':'Chưa đủ mẫu','entropy':round(_entropy(seq),4),
-                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'HYBRID MAX-COMPUTE V22',
-                'skills':0,'totalSkills':37,'updated_at':time.time()}
+                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'AI-FUSION ADAPTIVE V23',
+                'skills':0,'totalSkills':60,'ml':{'ready':False},'updated_at':time.time()}
     vote=lambda x: 1 if x=='TÀI' else -1
-    n=len(seq)
-    comps=[]
+    n=len(seq); comps=[]
     def add(name,score,weight):
         if isinstance(score,(int,float)) and math.isfinite(score):
             comps.append((name,_clamp(float(score),-.85,.85),float(weight)))
 
-    # Decayed contexts 1..5
+    # Decayed Markov / VOM contexts 1..5
     for order,wt in [(1,1.00),(2,1.15),(3,1.24),(4,1.18),(5,1.05)]:
         if n<order+5: continue
         ctx=tuple(seq[-order:]); p=x=1.6; ev=0.0
@@ -344,15 +513,26 @@ def model_snapshot(rows, game=None):
             ev+=w
         if ev>=1.2: add(f'ctx{order}',(p-x)/(p+x),wt)
 
-    # Multi-window balance with agreement guard
+    # Multi-window balance + EWMA trend
     vals=[]
-    for w in (6,10,18,30,48):
-        q=seq[-w:]
-        if len(q)>=min(6,w): vals.append(sum(vote(z) for z in q)/len(q))
+    for win in (6,10,18,30,48,80):
+        q=seq[-win:]
+        if len(q)>=min(6,win):
+            bal=sum(vote(z) for z in q)/len(q); vals.append(bal)
+            add(f'window{win}',bal,(.48+.30*min(1,win/48)))
     if vals:
         pos=sum(v>0 for v in vals); neg=sum(v<0 for v in vals)
         if max(pos,neg)/len(vals)>=.6:
-            add('multiwin',sum(v/(1+i*.35) for i,v in enumerate(vals))/sum(1/(1+i*.35) for i in range(len(vals)))*.44,.72)
+            add('multiwin',sum(v/(1+i*.32) for i,v in enumerate(vals))/sum(1/(1+i*.32) for i in range(len(vals)))*.46,.76)
+    ew=0.0; denew=0.0
+    for age,z in enumerate(reversed(seq[-80:])):
+        w=.5**(age/14); ew+=vote(z)*w; denew+=w
+    if denew:add('ewma',ew/denew,.72)
+    if n>=30:
+        a=sum(vote(z) for z in seq[-10:])/10
+        b=sum(vote(z) for z in seq[-30:-10])/20
+        add('balance_slope',(a-b)*.55,.62)
+        if abs(a-b)>=.35:add('changepoint',a*.24,.56)
 
     # Run pressure + flip/repeat state
     run=1
@@ -370,178 +550,185 @@ def model_snapshot(rows, game=None):
         if seq[i]==seq[i-1]: same+=w
         else: flip+=w
         ev+=w
-    if ev>=2: add('fliprepeat',vote(seq[-1])*(same-flip)/(same+flip),.66)
+    if ev>=2:add('fliprepeat',vote(seq[-1])*(same-flip)/(same+flip),.66)
+    if n>=10:
+        recent=seq[-14:]; flips=sum(1 for i in range(1,len(recent)) if recent[i]!=recent[i-1])
+        rate=flips/max(1,len(recent)-1)
+        if rate>.64:add('flippressure',-vote(seq[-1])*(rate-.5)*1.35,.72)
+        elif rate<.36:add('repeatpressure',vote(seq[-1])*(.5-rate)*1.25,.68)
 
-    # Recent transition
+    # Recent transition + run-length conditional
     if n>=12:
         cur=seq[-1]; p=x=1.5; ev=0.0
         for i in range(1,n):
             if seq[i-1]!=cur: continue
             w=0.5**(((n-1)-i)/24)
             if seq[i]=='TÀI': p+=w
-            else: x+=w
+            else:x+=w
             ev+=w
-        if ev>=2: add('transition',(p-x)/(p+x),.82)
-
-    # Run-length conditional
+        if ev>=2:add('transition',(p-x)/(p+x),.82)
     if n>=18:
         p=x=1.5; ev=0.0
         for i in range(2,n):
             rr=1; j=i-2
             while j>=0 and seq[j]==seq[i-1] and rr<8:
-                rr+=1; j-=1
-            if rr!=min(run,8): continue
+                rr+=1;j-=1
+            if rr!=min(run,8):continue
             w=0.5**(((n-1)-i)/30)
-            if seq[i]=='TÀI': p+=w
-            else: x+=w
+            if seq[i]=='TÀI':p+=w
+            else:x+=w
             ev+=w
-        if ev>=1.5: add('runcond',(p-x)/(p+x),.76)
+        if ev>=1.5:add('runcond',(p-x)/(p+x),.76)
 
-    # Motif 4/5
-    for L,wt in ((4,.78),(5,.84)):
-        if n<L+8: continue
-        motif=tuple(seq[-L:]); p=x=1.4; ev=0.0
+    # Motifs 3..6
+    for L,wt in ((3,.70),(4,.78),(5,.84),(6,.78)):
+        if n<L+8:continue
+        motif=tuple(seq[-L:]);p=x=1.4;ev=0.0
         for i in range(L,n):
-            if tuple(seq[i-L:i])!=motif: continue
+            if tuple(seq[i-L:i])!=motif:continue
             w=0.5**(((n-1)-i)/28)
-            if seq[i]=='TÀI': p+=w
-            else: x+=w
+            if seq[i]=='TÀI':p+=w
+            else:x+=w
             ev+=w
-        if ev>=1.2: add(f'motif{L}',(p-x)/(p+x),wt)
+        if ev>=1.2:add(f'motif{L}',(p-x)/(p+x),wt)
 
-    # Multi-window momentum
-    for win,wt in ((6,.54),(10,.62),(18,.70),(30,.74),(48,.78)):
-        if n>=win:
-            q=seq[-win:]; add(f'window{win}',(q.count('TÀI')-q.count('XỈU'))/win,wt)
+    # Markov order 2/3 with a separate recency window
+    for order,wt,half in ((2,.88,34),(3,.91,40)):
+        if n<order+18:continue
+        ctx=tuple(seq[-order:]);p=x=1.6;ev=0.0
+        for i in range(order,n):
+            if tuple(seq[i-order:i])!=ctx:continue
+            w=0.5**(((n-1)-i)/half);ev+=w
+            if seq[i]=='TÀI':p+=w
+            else:x+=w
+        if ev>=2:add(f'markov{order}',(p-x)/(p+x),wt)
 
-    # Flip/repeat pressure
-    if n>=10:
-        recent=seq[-14:]; flips=sum(1 for i in range(1,len(recent)) if recent[i]!=recent[i-1])
-        rate=flips/max(1,len(recent)-1)
-        if rate>.64: add('flippressure',-1 if seq[-1]=='TÀI' else 1,min(.88,.42+rate*.55))
-        elif rate<.36: add('repeatpressure',1 if seq[-1]=='TÀI' else -1,min(.84,.48+(1-rate)*.42))
-
-    # Markov order 2
-    if n>=20:
-        ctx=tuple(seq[-2:]); p=x=1.5; ev=0.0
-        for i in range(2,n):
-            if tuple(seq[i-2:i])!=ctx: continue
-            w=0.5**(((n-1)-i)/34); ev+=w
-            if seq[i]=='TÀI': p+=w
-            else: x+=w
-        if ev>=2: add('markov2',(p-x)/(p+x),.88)
-
-    # Markov order 3
-    if n>=28:
-        ctx=tuple(seq[-3:]); p=x=1.8; ev=0.0
-        for i in range(3,n):
-            if tuple(seq[i-3:i])!=ctx: continue
-            w=0.5**(((n-1)-i)/40); ev+=w
-            if seq[i]=='TÀI': p+=w
-            else: x+=w
-        if ev>=2.2: add('markov3',(p-x)/(p+x),.91)
-
-    # Multi-lag correlation votes
-    for lag in (2,3,4,5,6,8,10,12):
-        if n>=lag+18:
-            a=seq[-min(n,80):]; same=tot=0.0
-            for i in range(lag,len(a)):
-                w=0.5**(((len(a)-1)-i)/36); tot+=w
-                if a[i]==a[i-lag]: same+=w
-            if tot:
-                corr=(same/tot-.5)*2
-                if abs(corr)>=.16:
-                    base=1 if seq[-lag]=='TÀI' else -1
-                    add(f'lag{lag}',base*(1 if corr>0 else -1),min(.82,.42+abs(corr)*.7))
-
-    # Change point
-    if n>=32:
-        a=sum(vote(z) for z in seq[-10:])/10
-        b=sum(vote(z) for z in seq[-30:-10])/20
-        if abs(a-b)>=.35: add('changepoint',a*.24,.56)
-
-    # Autocorrelation 1..12 incl inversion
-    arr=[vote(x) for x in seq[-100:]]; best=0.0; lag=0
+    # Multi-lag positive/inverse autocorrelation candidates
+    arr=[vote(x) for x in seq[-120:]]; best=0.0; lag=0
     if len(arr)>=14:
-        mean=sum(arr)/len(arr); den=sum((x-mean)**2 for x in arr)
+        mean=sum(arr)/len(arr);den=sum((x-mean)**2 for x in arr)
         if den:
-            for k in range(1,min(12,len(arr)//3)+1):
-                num=sum((arr[i]-mean)*(arr[i+k]-mean) for i in range(len(arr)-k)); r=num/den
-                if abs(r)>abs(best): best=r; lag=k
+            for k in range(1,min(16,len(arr)//3)+1):
+                num=sum((arr[i]-mean)*(arr[i+k]-mean) for i in range(len(arr)-k));r=num/den
+                if abs(r)>abs(best):best=r;lag=k
+                if abs(r)>=.16:
+                    base=vote(seq[-k]);add(f'lag{k}',base*(1 if r>0 else -1)*min(.46,abs(r)*.75),.60)
     if lag:
-        lagv=vote(seq[-lag]); add('autocorr',(lagv if best>=0 else -lagv)*min(.44,abs(best)*.72),.76)
+        lagv=vote(seq[-lag]);add('autocorr',(lagv if best>=0 else -lagv)*min(.44,abs(best)*.72),.76)
 
-    # Dice/sum contexts aligned with rows
+    # Dice/sum contextual experts
     valid=[r for r in rows if r.get('result') in ('TÀI','XỈU')]
     if valid:
         cur_sum=valid[-1].get('sum')
         if isinstance(cur_sum,(int,float)):
-            p=x=1.7; ev=0
+            p=x=1.7;ev=0
             for i,r in enumerate(valid[:-1]):
-                if r.get('sum')!=cur_sum: continue
+                if r.get('sum')!=cur_sum:continue
                 w=0.5**(((len(valid)-2)-i)/40)
-                if valid[i+1]['result']=='TÀI': p+=w
-                else: x+=w
+                if valid[i+1]['result']=='TÀI':p+=w
+                else:x+=w
                 ev+=w
-            if ev>=1.8: add('exactsum',(p-x)/(p+x),.72)
+            if ev>=1.8:add('exactsum',(p-x)/(p+x),.72)
             bucket='LOW' if cur_sum<=8 else 'HIGH' if cur_sum>=13 else 'MID'
-            p=x=1.6; ev=0
+            p=x=1.6;ev=0
             for i,r in enumerate(valid[:-1]):
                 sm=r.get('sum')
-                if not isinstance(sm,(int,float)): continue
+                if not isinstance(sm,(int,float)):continue
                 b='LOW' if sm<=8 else 'HIGH' if sm>=13 else 'MID'
-                if b!=bucket: continue
+                if b!=bucket:continue
                 w=0.5**(((len(valid)-2)-i)/36)
-                if valid[i+1]['result']=='TÀI': p+=w
-                else: x+=w
+                if valid[i+1]['result']=='TÀI':p+=w
+                else:x+=w
                 ev+=w
-            if ev>=1.8: add('sumband',(p-x)/(p+x),.68)
+            if ev>=1.8:add('sumband',(p-x)/(p+x),.68)
+            if len(valid)>=3 and isinstance(valid[-2].get('sum'),(int,float)):
+                cur_delta=1 if cur_sum>valid[-2]['sum'] else -1 if cur_sum<valid[-2]['sum'] else 0
+                p=x=1.6;ev=0
+                for i in range(2,len(valid)):
+                    a=valid[i-2].get('sum');b=valid[i-1].get('sum')
+                    if not isinstance(a,(int,float)) or not isinstance(b,(int,float)):continue
+                    d=1 if b>a else -1 if b<a else 0
+                    if d!=cur_delta:continue
+                    w=.5**(((len(valid)-1)-i)/36)
+                    if valid[i]['result']=='TÀI':p+=w
+                    else:x+=w
+                    ev+=w
+                if ev>=1.8:add('sumdelta',(p-x)/(p+x),.64)
+
         cur_d=valid[-1].get('dice') or []
         if len(cur_d)>=3:
-            def state_parity(d): return sum(int(v)%2==0 for v in d[:3])
-            def state_high(d): return sum(int(v)>=4 for v in d[:3])
-            for name,fn,wt in [('parity',state_parity,.58),('highcount',state_high,.62)]:
-                cur=fn(cur_d); p=x=1.6; ev=0
+            def state_parity(d):return sum(int(v)%2==0 for v in d[:3])
+            def state_high(d):return sum(int(v)>=4 for v in d[:3])
+            def state_pair(d):return len(set(int(v) for v in d[:3]))
+            for name,fn,wt in [('parity',state_parity,.58),('highcount',state_high,.62),('pairstate',state_pair,.57)]:
+                cur=fn(cur_d);p=x=1.6;ev=0
                 for i,r in enumerate(valid[:-1]):
                     d=r.get('dice') or []
-                    if len(d)<3 or fn(d)!=cur: continue
-                    w=0.5**(((len(valid)-2)-i)/36)
-                    if valid[i+1]['result']=='TÀI': p+=w
-                    else: x+=w
+                    if len(d)<3 or fn(d)!=cur:continue
+                    w=.5**(((len(valid)-2)-i)/36)
+                    if valid[i+1]['result']=='TÀI':p+=w
+                    else:x+=w
                     ev+=w
-                if ev>=1.8: add(name,(p-x)/(p+x),wt)
+                if ev>=1.8:add(name,(p-x)/(p+x),wt)
+            # Per-position face-conditioned next-result experts
+            for pos in range(3):
+                face=int(cur_d[pos]);p=x=1.5;ev=0
+                for i,r in enumerate(valid[:-1]):
+                    d=r.get('dice') or []
+                    if len(d)<3:continue
+                    try:match=int(d[pos])==face
+                    except:match=False
+                    if not match:continue
+                    w=.5**(((len(valid)-2)-i)/38)
+                    if valid[i+1]['result']=='TÀI':p+=w
+                    else:x+=w
+                    ev+=w
+                if ev>=2.0:add(f'pos{pos+1}face',(p-x)/(p+x),.54)
 
-    active=[c for c in comps if abs(c[1])>=.035]
-    if not active:
-        active=[('fallback',vote(seq[-1])*.02,.25)]
-    num=sum(sc*wt for _,sc,wt in active); den=sum(abs(wt) for _,_,wt in active) or 1
+        # Weak crowd-flow expert if source exposes totals; never treated as ground truth.
+        meta=valid[-1].get('meta') or {}
+        try:
+            tt=float(meta.get('total_tai'));tx=float(meta.get('total_xiu'))
+            crowd=(tt-tx)/max(1.0,tt+tx)
+            if abs(crowd)>=.03:add('crowdflow',crowd*.35,.28)
+        except:pass
+
+    # Online logistic learner trained/validated only on this board's historical rows.
+    ml=_online_ml_signal(rows,board)
+    if ml.get('ready') and abs(ml.get('score',0))>=.012:
+        # validation/reliability is already folded into score; keep it as one expert, not a dictator.
+        add('online_ml',ml['score'],1.12)
+
+    active=[c for c in comps if abs(c[1])>=.028]
+    if not active:active=[('fallback',vote(seq[-1])*.02,.25)]
+    num=sum(sc*wt for _,sc,wt in active);den=sum(abs(wt) for _,_,wt in active) or 1
     raw=num/den
-    pos=sum(1 for _,sc,_ in active if sc>0); neg=sum(1 for _,sc,_ in active if sc<0)
-    agreement=max(pos,neg)/max(1,len(active))
+    posw=sum(abs(wt) for _,sc,wt in active if sc>0);negw=sum(abs(wt) for _,sc,wt in active if sc<0)
+    agreement=max(posw,negw)/max(.001,posw+negw)
     H=_entropy(seq[-80:])
-    sample_factor=_clamp(n/36,.58,1.0)
-    entropy_factor=_clamp(1.25-H*.46,.70,1.0)
-    agree_factor=.66 if agreement<.56 else .84 if agreement<.67 else 1.0
+    sample_factor=_clamp(n/42,.56,1.0)
+    entropy_factor=_clamp(1.22-H*.43,.72,1.0)
+    agree_factor=.62 if agreement<.55 else .82 if agreement<.67 else 1.0
     score=_clamp(raw*sample_factor*entropy_factor*agree_factor,-.82,.82)
-    # Ensemble disagreement damping: more modules must not create fake certainty.
-    _pos=sum(abs(w) for _,v,w in signals if v>0)
-    _neg=sum(abs(w) for _,v,w in signals if v<0)
-    _agree=max(_pos,_neg)/max(.001,_pos+_neg)
-    score=score*(1.0-min(.42,(1.0-_agree)*.72))
-    if abs(score)<.014: score=vote(seq[-1])*.014
+    # explicit conflict damping (fixes the old undefined `signals` runtime bug)
+    score*=1.0-min(.42,max(0.0,1.0-agreement)*.72)
+    if abs(score)<.012:score=vote(seq[-1])*.012
     pred='TÀI' if score>=0 else 'XỈU'
-    evidence=_clamp(abs(score)*1.95+max(0,agreement-.5)*.48,0,1)
+    evidence=_clamp(abs(score)*1.92+max(0,agreement-.5)*.46,0,1)
     cap=64 if game=='baccarat' else 69
     conf=round(_clamp(50+evidence*(cap-50),51,cap))
-    if run>=3: pattern=f"BỆT {seq[-1]} x{run}"
-    elif current_flip: pattern='ĐẢO 1-1 / FLIP'
-    else: pattern='CẦU HỖN HỢP'
-    alt=f"{len(active)} tín hiệu · đồng thuận {round(agreement*100)}% · entropy {H:.3f}"
+    if run>=3:pattern=f"BỆT {seq[-1]} x{run}"
+    elif current_flip:pattern='ĐẢO 1-1 / FLIP'
+    else:pattern='CẦU HỖN HỢP'
+    top=sorted(active,key=lambda c:abs(c[1]*c[2]),reverse=True)[:8]
+    top_signals=[{'name':name,'score':round(sc,3),'weight':round(wt,3)} for name,sc,wt in top]
+    ml_txt=(f" · ML val {round(ml.get('val_accuracy',.5)*100)}%" if ml.get('ready') else '')
+    alt=f"{len(active)} tín hiệu · đồng thuận {round(agreement*100)}% · entropy {H:.3f}{ml_txt}"
     return {'sample':n,'score':round(score,4),'prediction':pred,'confidence':conf,'percent':conf,
             'run':run,'pattern':pattern,'alt':alt,'entropy':round(H,4),
             'cycle':{'k':lag,'r':round(best,4)},'agreement':round(agreement,4),
-            'engine':'HYBRID MAX-COMPUTE V22','skills':len(active),'totalSkills':37,
-            'updated_at':time.time()}
+            'engine':'AI-FUSION ADAPTIVE V23','skills':len(active),'totalSkills':60,
+            'ml':ml,'top_signals':top_signals,'updated_at':time.time()}
 
 
 async def store_rows(board, rows):
@@ -639,7 +826,7 @@ def _drop_stale_pending(board,target_session):
 def _create_shared_prediction(board, rows, current_session=None):
     if not rows: return None,False
     game=board.split(':',1)[0]
-    model=model_snapshot(rows,game)
+    model=model_snapshot(rows,game,board)
     if board=='sunwin:sicbo':
         model['dice_forecast']=dice_position_forecast(rows)
     if board=='lc79:xocdia' and model.get('prediction'):
@@ -683,7 +870,7 @@ async def refresh_shared_prediction(board,current_session=None):
 
 async def set_state(board, ok, error=None):
     rows=load_rows(board,500)
-    model=model_snapshot(rows, board.split(':',1)[0])
+    model=model_snapshot(rows, board.split(':',1)[0], board)
     async with _db_lock:
         with sqlite3.connect(DB_PATH) as db:
             db.execute('''INSERT INTO board_state(board,updated_at,source_ok,last_error,model_json)
@@ -872,10 +1059,79 @@ def grant_access(chat_id,admin_id=None,enabled=True):
 
 
 def admin_help():
-    return ('🛠 ADMIN V22\n/grant <user_id> · cấp quyền\n/revoke <user_id> · thu quyền\n'
-            '/users · danh sách quyền\n/apis · xem link API\n/ai · giải thích tín hiệu bằng ChatGPT (nếu đã cấu hình)\n'
-            '/setapi <board> <current_url> [history_url]\n/resetapi <board>\n'
-            'Board ví dụ: sunwin:hu, sunwin:sicbo, lc79:xocdia, max789:md5')
+    return ('🛠 ADMIN V23 · AI-FUSION\n'
+            '/grant <user_id> · cấp quyền dự đoán\n/revoke <user_id> · thu quyền\n/users · danh sách quyền\n'
+            '/health · trạng thái nguồn all-game\n/stats · thống kê DB/user/dự đoán\n'
+            '/engine [board] · chẩn đoán engine + Online ML\n/testapi <board> · test API hiện tại\n'
+            '/apis · xem link API\n/setapi <board> <current_url> [history_url]\n/resetapi <board>\n'
+            '/ai · ChatGPT giải thích tín hiệu nếu có cấu hình\n'
+            'Board VD: sunwin:sicbo · lc79:xocdia · max789:md5 · son789:hu')
+
+
+def admin_health_text():
+    with sqlite3.connect(DB_PATH) as db:
+        state={b:(u,ok,err) for b,u,ok,err in db.execute('SELECT board,updated_at,source_ok,last_error FROM board_state')}
+    now=time.time();lines=['🩺 API HEALTH · V23']
+    for b in BOARDS:
+        u,ok,err=state.get(b,(0,0,'chưa có dữ liệu'))
+        age=max(0,int(now-u)) if u else -1
+        icon='🟢' if ok and age<=max(15,int(POLL_SECONDS*8)) else '🟡' if ok else '🔴'
+        suffix=f' · {age}s' if age>=0 else ''
+        lines.append(f"{icon} {board_label(b)}{suffix}"+(f" · {str(err)[:55]}" if not ok and err else ''))
+    return '\n'.join(lines)[:4000]
+
+
+def admin_stats_text():
+    with sqlite3.connect(DB_PATH) as db:
+        users=db.execute('SELECT COUNT(*) FROM bot_access').fetchone()[0]
+        active=db.execute('SELECT COUNT(*) FROM bot_access WHERE enabled=1').fetchone()[0]
+        rounds=db.execute('SELECT COUNT(*) FROM rounds').fetchone()[0]
+        preds=db.execute('SELECT COUNT(*) FROM shared_predictions').fetchone()[0]
+        settled=db.execute('SELECT COUNT(*) FROM shared_predictions WHERE actual IS NOT NULL').fetchone()[0]
+        wins=db.execute('SELECT COUNT(*) FROM shared_predictions WHERE ok=1').fetchone()[0]
+        boards=db.execute('SELECT COUNT(DISTINCT board) FROM rounds').fetchone()[0]
+    hit=(wins/settled*100) if settled else 0.0
+    return (f"📊 STATS V23\nUser quyền: {active}/{users}\nBoard có dữ liệu: {boards}\n"
+            f"Round đang lưu: {rounds}\nPrediction: {preds} · đã chốt {settled}\n"
+            f"Đúng lịch sử: {wins}/{settled} ({hit:.1f}%)\n"
+            "Tỷ lệ lịch sử chỉ để theo dõi, không phải bảo đảm cho phiên kế.")
+
+
+def engine_diag_text(board):
+    if board not in available_bot_boards():return 'Board không hợp lệ.'
+    rows=load_rows(board,MAX_HISTORY)
+    m=model_snapshot(rows,board.split(':',1)[0],board)
+    ml=m.get('ml') or {}
+    top=m.get('top_signals') or []
+    lines=[f"🧠 ENGINE · {board_label(board)}",
+           f"{m.get('engine')} · sample {m.get('sample',0)}",
+           f"Prediction: {display_pred(board,m.get('prediction'))} · {m.get('confidence',50)}%",
+           f"Đồng thuận: {round(m.get('agreement',0)*100)}% · entropy {m.get('entropy',1):.3f}",
+           f"Skills: {m.get('skills',0)}/{m.get('totalSkills',48)}"]
+    if ml.get('ready'):
+        lines.append(f"Online ML: P(TÀI) {round(ml.get('p_tai',.5)*100)}% · val {round(ml.get('val_accuracy',.5)*100)}% · Brier {ml.get('brier',.25)}")
+    else:lines.append('Online ML: đang tích mẫu')
+    if top:
+        lines.append('Top signal: '+', '.join(f"{x['name']}({x['score']:+.2f})" for x in top[:6]))
+    return '\n'.join(lines)[:4000]
+
+
+async def admin_test_api(client,board):
+    if board not in BOARDS:return 'Board không hợp lệ.'
+    cfg=effective_cfg(board,BOARDS[board]);t0=time.perf_counter()
+    try:
+        data,url=await fetch_first(client,[cfg.get('current')]+cfg.get('current_fallbacks',[]))
+        if cfg.get('kind')=='baccarat':
+            tables=parse_baccarat(data);count=sum(len(v) for v in tables.values())
+            latest=max((_session_num(r.get('id')) or 0 for arr in tables.values() for r in arr),default=0)
+        else:
+            rows=parse_xocdia(data) if cfg.get('kind')=='xocdia' else parse_tx(data)
+            count=len(rows);latest=_current_anchor(rows) or (rows[-1]['id'] if rows else '---')
+        ms=round((time.perf_counter()-t0)*1000)
+        return f"✅ TEST API {board_label(board)}\n{ms} ms · rows {count} · phiên {latest}\n{url}"
+    except Exception as e:
+        return f"❌ TEST API {board_label(board)}\n{str(e)[:300]}"
+
 
 def bot_games_keyboard(chat_id):
     boards=available_bot_boards(); rows=[]
@@ -892,7 +1148,8 @@ def bot_games_keyboard(chat_id):
 def bot_board_keyboard(board):
     return {'inline_keyboard':[
       [{'text':'▶️ AUTO','callback_data':'on|'+board},{'text':'⏹ TẮT','callback_data':'off|'+board}],
-      [{'text':'🎯 XEM','callback_data':'now|'+board},{'text':'📜 LS','callback_data':'hist|'+board},{'text':'🎮 GAME','callback_data':'games'}]
+      [{'text':'🎯 XEM','callback_data':'now|'+board},{'text':'🧠 AI','callback_data':'ai|'+board},{'text':'📜 LS','callback_data':'hist|'+board}],
+      [{'text':'🎮 GAME','callback_data':'games'}]
     ]}
 
 
@@ -903,7 +1160,7 @@ def format_prediction(board,pred):
     text=(f"🎮 {board_label(board)}\n"
           f"Phiên #{p.get('session','---')}\n"
           f"Dự đoán: {display_pred(board,p.get('prediction'))} · {p.get('confidence',50)}%\n"
-          f"Engine: {model.get('engine','HYBRID MAX-COMPUTE V22')}\n"
+          f"Engine: {model.get('engine','AI-FUSION ADAPTIVE V23')}\n"
           f"Mẫu: {model.get('pattern','---')} · {model.get('sample',0)} phiên")
     df=model.get('dice_forecast') or {}
     if board=='sunwin:sicbo' and df.get('ready'):
@@ -912,6 +1169,9 @@ def format_prediction(board,pred):
     xf=model.get('xocdia_forecast') or {}
     if board=='lc79:xocdia' and xf:
         text += f"\n⚪🔴 Thế phụ: {xf.get('label','---')}"
+    ml=model.get('ml') or {}
+    if ml.get('ready'):
+        text += f"\n🤖 Online ML: P(TÀI) {round(ml.get('p_tai',.5)*100)}% · val {round(ml.get('val_accuracy',.5)*100)}%"
     return text
 
 
@@ -1028,6 +1288,16 @@ async def bot_handle_message(client,msg):
         with sqlite3.connect(DB_PATH) as db: rows=db.execute('SELECT chat_id,enabled,updated_at FROM bot_access ORDER BY updated_at DESC LIMIT 100').fetchall()
         out='👥 QUYỀN DỰ ĐOÁN\n'+('\n'.join(f"{uid} · {'ON' if en else 'OFF'}" for uid,en,_ in rows) if rows else 'Chưa cấp user nào.')
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':out});return
+    if is_admin(chat_id) and text.startswith('/health'):
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':admin_health_text()});return
+    if is_admin(chat_id) and text.startswith('/stats'):
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':admin_stats_text()});return
+    if is_admin(chat_id) and text.startswith('/engine'):
+        parts=text.split(maxsplit=1);b=parts[1].strip() if len(parts)>1 else get_selected_board(chat_id)
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':engine_diag_text(b) if b else 'Cú pháp: /engine <board>'});return
+    if is_admin(chat_id) and text.startswith('/testapi '):
+        b=text.split(maxsplit=1)[1].strip()
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':await admin_test_api(client,b)});return
     if is_admin(chat_id) and text.startswith('/apis'):
         lines=['🔗 API V22']
         for b,c in BOARDS.items():
@@ -1036,6 +1306,8 @@ async def bot_handle_message(client,msg):
     if is_admin(chat_id) and text.startswith('/setapi '):
         parts=text.split(maxsplit=3)
         if len(parts)<3 or parts[1] not in BOARDS: out='Cú pháp: /setapi <board> <current_url> [history_url]'
+        elif not parts[2].startswith(('http://','https://')): out='❌ current_url phải bắt đầu bằng http:// hoặc https://'
+        elif len(parts)>3 and parts[3] and not parts[3].startswith(('http://','https://')): out='❌ history_url phải bắt đầu bằng http:// hoặc https://'
         else:
             set_api_override(parts[1],parts[2],parts[3] if len(parts)>3 else None);out=f'✅ Đã đổi API {parts[1]}'
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':out});return
@@ -1048,7 +1320,7 @@ async def bot_handle_message(client,msg):
     if text.startswith('/start') or text.startswith('/games'):
         if not has_access(chat_id):
             await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':f'🔒 Tài khoản chưa được cấp quyền dự đoán.\nUser ID: {chat_id}\nGửi ID này cho admin.'});return
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'TAIXIUTOOL V22 · HYBRID ALL-GAME\nLIVE API khóa phiên + history/SQLite học tối đa 1000 phiên.','reply_markup':bot_games_keyboard(chat_id)})
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'TAIXIUTOOL V23 · AI-FUSION ALL-GAME\nLIVE API khóa phiên + history/SQLite học tối đa 1000 phiên.','reply_markup':bot_games_keyboard(chat_id)})
         return
     if not has_access(chat_id):
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':f'🔒 Chưa có quyền dự đoán. User ID: {chat_id}'});return
@@ -1089,6 +1361,7 @@ async def bot_handle_callback(client,q):
     elif action=='off':
         set_sub(chat_id,board,False); txt=f'🔕 Đã tắt AUTO {board_label(board)}.'
     elif action=='now': txt=format_prediction(board,get_shared_prediction(board))
+    elif action=='ai': txt=await ai_explain_board(client,board)
     elif action=='hist': txt=format_history(board)
     else: return
     await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':txt,'reply_markup':bot_board_keyboard(board)})
@@ -1124,12 +1397,12 @@ async def lifespan(app: FastAPI):
             try: await task
             except BaseException: pass
 
-app=FastAPI(title='TAIXIUTOOL V22 Hybrid All-Game API', lifespan=lifespan)
+app=FastAPI(title='TAIXIUTOOL V23 AI-Fusion All-Game API', lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_credentials=False,allow_methods=['GET'],allow_headers=['*'])
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'admin_count':len(ADMIN_IDS),'max_history':MAX_HISTORY,'chatgpt_enabled':bool(OPENAI_API_KEY and OPENAI_MODEL),'engine':'HYBRID MAX-COMPUTE V22'}
+    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'admin_count':len(ADMIN_IDS),'max_history':MAX_HISTORY,'chatgpt_enabled':bool(OPENAI_API_KEY and OPENAI_MODEL),'engine':'AI-FUSION ADAPTIVE V23'}
 
 @app.get('/api/learn/{game}/{table}')
 def learn(game:str, table:str, limit:int=Query(1000,ge=20,le=1000), sub:str|None=None):
@@ -1137,14 +1410,14 @@ def learn(game:str, table:str, limit:int=Query(1000,ge=20,le=1000), sub:str|None
         if sub:
             board=f'baccarat:{sub}'
             rows=load_rows(board,limit)
-            return {'game':game,'table':table,'sub':sub,'rows':rows,'model':model_snapshot(rows,game),
+            return {'game':game,'table':table,'sub':sub,'rows':rows,'model':model_snapshot(rows,game,board),
                     'shared_prediction':get_shared_prediction(board),'prediction_history':get_prediction_history(board,20)}
         with sqlite3.connect(DB_PATH) as db:
             names=[r[0].split(':',1)[1] for r in db.execute("SELECT DISTINCT board FROM rounds WHERE board LIKE 'baccarat:%' AND board<>'baccarat:main'")]
         tables={}
         for name in names:
             board=f'baccarat:{name}'; rows=load_rows(board,limit)
-            tables[name]={'rows':rows,'model':model_snapshot(rows,game),'shared_prediction':get_shared_prediction(board),'prediction_history':get_prediction_history(board,20)}
+            tables[name]={'rows':rows,'model':model_snapshot(rows,game,board),'shared_prediction':get_shared_prediction(board),'prediction_history':get_prediction_history(board,20)}
         return {'game':game,'table':table,'tables':tables}
     board=f'{game}:{table}'
     if board not in BOARDS:
@@ -1155,7 +1428,7 @@ def learn(game:str, table:str, limit:int=Query(1000,ge=20,le=1000), sub:str|None
         row=db.execute('SELECT updated_at,source_ok,last_error,model_json FROM board_state WHERE board=?',(board,)).fetchone()
         if row:
             state={'updated_at':row[0],'source_ok':bool(row[1]),'last_error':row[2], 'model':json.loads(row[3]) if row[3] else None}
-    return {'game':game,'table':table,'rows':rows,'model':model_snapshot(rows,game),'state':state,
+    return {'game':game,'table':table,'rows':rows,'model':model_snapshot(rows,game,board),'state':state,
             'shared_prediction':get_shared_prediction(board),'prediction_history':get_prediction_history(board,20)}
 
 @app.get('/api/predict/{game}/{table}')
