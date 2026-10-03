@@ -63,6 +63,8 @@ BOARDS = {
     'max789:md5': {'game':'max789','table':'md5','kind':'tx_single','current':'https://person-talent-mission-opening.trycloudflare.com/api/txmd5'},
     'son789:hu': {'game':'son789','table':'hu','kind':'tx_single','current':'https://pregnancy-blake-debut-hybrid.trycloudflare.com/api/tx'},
     'son789:md5': {'game':'son789','table':'md5','kind':'tx_single','current':'https://pregnancy-blake-debut-hybrid.trycloudflare.com/api/txmd5'},
+    'hitclub:hu': {'game':'hitclub','table':'hu','kind':'tx_single','current':'https://apihitclubhihi.onrender.com/api/hitclub/hu'},
+    'hitclub:md5': {'game':'hitclub','table':'md5','kind':'tx_single','current':'https://apihitclubhihi.onrender.com/api/hitclub/md5'},
     'baccarat:main': {'game':'baccarat','table':'main','kind':'baccarat','current':'https://jjjjbcrsexxy-1.onrender.com/api/bcrvh11'},
 }
 
@@ -125,6 +127,22 @@ def ensure_db():
         )''')
         db.execute('''CREATE TABLE IF NOT EXISTS api_overrides(
             board TEXT PRIMARY KEY, current_url TEXT, history_url TEXT, updated_at REAL NOT NULL
+        )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS strategy_logs(
+            board TEXT NOT NULL,
+            session TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            prediction TEXT NOT NULL,
+            actual TEXT,
+            ok INTEGER,
+            created_at REAL NOT NULL,
+            settled_at REAL,
+            PRIMARY KEY(board,session,strategy)
+        )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS champion_state(
+            board TEXT PRIMARY KEY,
+            champion TEXT,
+            updated_at REAL NOT NULL
         )''')
         db.execute('''CREATE TABLE IF NOT EXISTS timeout_runs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -654,7 +672,7 @@ def model_snapshot(rows, game=None, board=None):
     if len(seq)<6:
         return {'sample':len(seq),'score':0.0,'prediction':None,'confidence':50,'percent':50,
                 'pattern':'ĐANG HỌC','alt':'Chưa đủ mẫu','entropy':round(_entropy(seq),4),
-                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'GPT-DEEP + AI-FUSION V29',
+                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'CHAMPION STRATEGY + FUSION V32',
                 'skills':0,'totalSkills':60,'ml':{'ready':False},'updated_at':time.time()}
     vote=lambda x: 1 if x=='TÀI' else -1
     n=len(seq); comps=[]
@@ -900,8 +918,279 @@ def model_snapshot(rows, game=None, board=None):
     return {'sample':n,'score':round(score,4),'prediction':pred,'confidence':conf,'percent':conf,
             'run':run,'pattern':pattern,'alt':alt,'entropy':round(H,4),
             'cycle':{'k':lag,'r':round(best,4)},'agreement':round(agreement,4),
-            'engine':'GPT-DEEP + AI-FUSION V29','skills':len(active),'totalSkills':60,
+            'engine':'CHAMPION STRATEGY + FUSION V32','skills':len(active),'totalSkills':60,
             'ml':ml,'top_signals':top_signals,'updated_at':time.time()}
+
+# V32: V31 fusion becomes one candidate strategy instead of the only final decider.
+fusion_model_snapshot = model_snapshot
+
+STRATEGY_NAMES = (
+    'FOLLOW_LAST','REVERSE_LAST','ALTERNATING_PATTERN','RUN_BREAK','RUN_FOLLOW',
+    'BIAS_MEAN_REVERSION','BIAS_MOMENTUM','MARKOV_TRANSITION','ANTI_RAW',
+    'HIGH_ORDER_MARKOV','SUFFIX_CONTEXT','FUSION_CORE'
+)
+
+def _opp(side):
+    return 'XỈU' if side=='TÀI' else 'TÀI'
+
+def _seq(rows):
+    return [r.get('result') for r in rows if r.get('result') in ('TÀI','XỈU')]
+
+def _run_len(seq):
+    if not seq: return 0
+    n=1
+    for i in range(len(seq)-2,-1,-1):
+        if seq[i]==seq[-1]: n+=1
+        else: break
+    return n
+
+def _markov_prediction(seq, order=1):
+    if not seq: return 'TÀI'
+    order=max(1,min(4,int(order)))
+    if len(seq)<=order+2: return _opp(seq[-1])
+    ctx=tuple(seq[-order:]); t=x=1.0
+    for i in range(order,len(seq)):
+        if tuple(seq[i-order:i])!=ctx: continue
+        if seq[i]=='TÀI': t+=1
+        else: x+=1
+    return 'TÀI' if t>=x else 'XỈU'
+
+def _suffix_prediction(seq):
+    if not seq: return 'TÀI'
+    for L in (6,5,4,3,2):
+        if len(seq)<=L: continue
+        motif=tuple(seq[-L:]); t=x=0
+        for i in range(L,len(seq)):
+            if tuple(seq[i-L:i])!=motif: continue
+            if seq[i]=='TÀI': t+=1
+            else: x+=1
+        if t+x>=2: return 'TÀI' if t>=x else 'XỈU'
+    return _markov_prediction(seq,1)
+
+def _recent_final_stats(board,limit=50):
+    with sqlite3.connect(DB_PATH) as db:
+        rows=db.execute(
+            '''SELECT prediction,actual,ok,model_json
+               FROM shared_predictions
+               WHERE board=? AND actual IS NOT NULL AND ok IS NOT NULL
+               ORDER BY settled_at DESC LIMIT ?''',(board,int(limit))
+        ).fetchall()
+    out=[]
+    for pred,actual,ok,mj in rows:
+        try: model=json.loads(mj) if mj else {}
+        except: model={}
+        out.append({'prediction':pred,'actual':actual,'ok':bool(ok),'model':model})
+    return out
+
+def _anti_phase(board):
+    hist=_recent_final_stats(board,20)
+    anti_tai=anti_xiu=wrong=0
+    for h in hist:
+        if h['ok']: continue
+        wrong+=1
+        raw=(h.get('model') or {}).get('raw_prediction') or h.get('prediction')
+        if raw=='TÀI': anti_xiu+=1
+        elif raw=='XỈU': anti_tai+=1
+    return {'wrong_rate':wrong/max(1,len(hist)),'anti_tai':anti_tai,'anti_xiu':anti_xiu,'sample':len(hist)}
+
+def _strategy_predictors(board,rows,fusion):
+    seq=_seq(rows)
+    if not seq: seq=['TÀI']
+    last=seq[-1]; run=_run_len(seq)
+    q6=seq[-6:]
+    flips=sum(1 for i in range(1,len(q6)) if q6[i]!=q6[i-1])
+    alt_rate=flips/max(1,len(q6)-1)
+    p20=seq[-20:].count('TÀI')/max(1,len(seq[-20:]))
+    p12=seq[-12:].count('TÀI')/max(1,len(seq[-12:]))
+    markov=_markov_prediction(seq,1)
+    high=_markov_prediction(seq,3)
+    final_hist=_recent_final_stats(board,20)
+    raw_bad=(sum(1 for h in final_hist if not h['ok'])/max(1,len(final_hist))) if final_hist else 0.0
+    fusion_pred=fusion.get('prediction') if fusion.get('prediction') in ('TÀI','XỈU') else markov
+    preds={}
+    def put(name,pred,conf,reason):
+        preds[name]={'name':name,'prediction':pred,'local_confidence':int(_clamp(conf,45,72)),'reason':reason}
+    put('FOLLOW_LAST',last,51,'Theo kết quả gần nhất')
+    put('REVERSE_LAST',_opp(last),51,'Đảo kết quả gần nhất')
+    put('ALTERNATING_PATTERN',_opp(last) if alt_rate>=.60 else markov,50+abs(alt_rate-.5)*20,f'Alt rate {alt_rate:.2f}')
+    put('RUN_BREAK',_opp(last) if run>=3 else markov,50+min(10,run*1.5),f'Run {run}')
+    put('RUN_FOLLOW',last if 2<=run<=3 else (_opp(last) if run>=5 else markov),50+min(9,run*1.3),f'Run {run}')
+    put('BIAS_MEAN_REVERSION','XỈU' if p20>=.60 else 'TÀI' if p20<=.40 else _opp(last),50+abs(p20-.5)*25,f'pT20 {p20:.2f}')
+    put('BIAS_MOMENTUM','TÀI' if p12>=.58 else 'XỈU' if p12<=.42 else last,50+abs(p12-.5)*28,f'pT12 {p12:.2f}')
+    put('MARKOV_TRANSITION',markov,53,'Markov chuyển trạng thái bậc 1')
+    put('ANTI_RAW',_opp(fusion_pred) if raw_bad>=.55 else _opp(last),50+min(10,raw_bad*12),f'Wrong rate {raw_bad:.2f}')
+    put('HIGH_ORDER_MARKOV',high,53,'Markov ngữ cảnh bậc 3')
+    put('SUFFIX_CONTEXT',_suffix_prediction(seq),52,'Suffix/motif context 2–6')
+    put('FUSION_CORE',fusion_pred,int(fusion.get('confidence',50)),'V31 fusion core độc lập')
+    return preds
+
+def _strategy_rows(board):
+    with sqlite3.connect(DB_PATH) as db:
+        rows=db.execute(
+            '''SELECT session,strategy,prediction,actual,ok,settled_at
+               FROM strategy_logs WHERE board=? AND actual IS NOT NULL AND ok IS NOT NULL
+               ORDER BY settled_at DESC''',(board,)
+        ).fetchall()
+    by={}
+    for session,name,pred,actual,ok,settled in rows:
+        by.setdefault(name,[]).append({'session':session,'prediction':pred,'actual':actual,'ok':bool(ok),'settled_at':settled})
+    return by
+
+def _stats_for(rows,window):
+    q=rows[:window]; n=len(q); wins=sum(1 for r in q if r['ok'])
+    streak=0
+    for r in q:
+        if r['ok']: break
+        streak+=1
+    return {'total':n,'win':wins,'loss':n-wins,'win_rate':wins/n if n else .5,'loss_streak':streak}
+
+def get_strategy_stats_map(board):
+    by=_strategy_rows(board); out={}
+    for name in STRATEGY_NAMES:
+        rows=by.get(name,[])
+        s20=_stats_for(rows,20); s50=_stats_for(rows,50); s100=_stats_for(rows,100)
+        score=.50*s20['win_rate']+.35*s50['win_rate']+.15*s100['win_rate']
+        if s20['total']<10: score-=.05
+        if s50['total']<25: score-=.05
+        if s20['loss_streak']>=3: score-=.07
+        if s20['total']>=10 and s20['win_rate']<.45: score-=.10
+        if s50['total']>=20 and s50['win_rate']<.48: score-=.05
+        if s20['total']>=10 and s20['win_rate']>=.55: score+=.05
+        if s50['total']>=20 and s50['win_rate']>=.53: score+=.05
+        valid=((s20['total']>=10 or s50['total']>=25) and score>=.50)
+        out[name]={'short':s20,'mid':s50,'long':s100,'performance_score':round(score,4),'valid':valid}
+    return out
+
+def _champion_locked(board,candidate,stats):
+    with sqlite3.connect(DB_PATH) as db:
+        r=db.execute('SELECT champion FROM champion_state WHERE board=?',(board,)).fetchone()
+    old=r[0] if r else None
+    if old and old in stats and candidate in stats:
+        os=stats[old]; ns=stats[candidate]; o20=os['short']
+        keep=(o20['loss_streak']<3 and (o20['win_rate']>=.48 or o20['total']<10))
+        if keep and ns['performance_score'] < os['performance_score']+.08:
+            candidate=old
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            '''INSERT INTO champion_state(board,champion,updated_at) VALUES(?,?,?)
+               ON CONFLICT(board) DO UPDATE SET champion=excluded.champion,updated_at=excluded.updated_at''',
+            (board,candidate,time.time())
+        ); db.commit()
+    return candidate
+
+def select_champion(board,preds):
+    stats=get_strategy_stats_map(board)
+    valid=[n for n in STRATEGY_NAMES if n in preds and stats.get(n,{}).get('valid')]
+    candidate=max(valid,key=lambda n:stats[n]['performance_score']) if valid else ('MARKOV_TRANSITION' if 'MARKOV_TRANSITION' in preds else 'REVERSE_LAST')
+    candidate=_champion_locked(board,candidate,stats)
+    if candidate not in preds: candidate='MARKOV_TRANSITION' if 'MARKOV_TRANSITION' in preds else next(iter(preds))
+    return candidate,stats
+
+def _final_performance(board):
+    h=_recent_final_stats(board,50); q20=h[:20]; q50=h[:50]
+    wr20=sum(1 for x in q20 if x['ok'])/len(q20) if q20 else .5
+    wr50=sum(1 for x in q50 if x['ok'])/len(q50) if q50 else .5
+    streak=0
+    for x in h:
+        if x['ok']: break
+        streak+=1
+    reverse=(sum(1 for x in q20 if not x['ok'])/len(q20)) if q20 else .5
+    return {'n20':len(q20),'n50':len(q50),'wr20':wr20,'wr50':wr50,'loss_streak':streak,
+            'normal_win_rate':wr20,'reverse_win_rate':reverse}
+
+def _champion_confidence(st,recovery=False,recent=None):
+    s20=st.get('short',{}); s50=st.get('mid',{})
+    w20=float(s20.get('win_rate',.5)); w50=float(s50.get('win_rate',.5))
+    conf=50+max(0,w20-.50)*100+max(0,w50-.50)*50
+    if s20.get('total',0)<10: conf-=5
+    if s20.get('loss_streak',0)>=3: conf-=8
+    if s20.get('total',0)>=10 and w20<.48: conf-=8
+    if s50.get('total',0)>=20 and w50<.50: conf-=5
+    conf=_clamp(conf,45,75)
+    if conf<55: display=min(58,conf+3)
+    elif conf<65: display=min(68,conf+5)
+    else: display=min(78,conf+6)
+    if recent and recent.get('n20',0)>=20 and recent.get('wr20',.5)<.45: display=min(58,conf+2)
+    if recovery: display=min(display,58)
+    return int(round(conf)),int(round(display))
+
+def _status_from_conf(model_conf,st):
+    s20=st.get('short',{})
+    if model_conf>=65 and s20.get('total',0)>=10 and s20.get('win_rate',.5)>=.55: status='MẠNH'
+    elif model_conf>=58: status='TRUNG BÌNH'
+    elif model_conf>=50: status='YẾU'
+    else: status='NGUY HIỂM'
+    if s20.get('total',0)<10 and status in ('MẠNH','TRUNG BÌNH'): status='YẾU'
+    return status
+
+def model_snapshot(rows, game=None, board=None):
+    fusion=fusion_model_snapshot(rows,game,board)
+    if not board: return fusion
+    seq=_seq(rows)
+    if len(seq)<2:
+        fusion['engine']='CHAMPION STRATEGY + FUSION V32'
+        return fusion
+    preds=_strategy_predictors(board,rows,fusion)
+    champion,stats=select_champion(board,preds)
+    recent=_final_performance(board)
+    recovery=((recent['n50']>=50 and recent['wr50']<.45) or
+              (recent['n20']>=20 and recent['wr20']<.40) or
+              recent['loss_streak']>=5)
+    reverse_mode=((recent['n20']>=20 and recent['wr20']<.45) or
+                  (recent['n20']>=20 and recent['reverse_win_rate']-recent['normal_win_rate']>=.15))
+    raw=preds[champion]['prediction']; final=_opp(raw) if reverse_mode else raw
+    st=stats.get(champion,{})
+    model_conf,display=_champion_confidence(st,recovery,recent)
+    anti=_anti_phase(board)
+    mode='RECOVERY + REVERSE' if recovery and reverse_mode else 'RECOVERY' if recovery else 'REVERSE' if reverse_mode else 'FORCED'
+    rank=sorted(
+        ({'name':n,'score':stats[n]['performance_score'],
+          'w20':round(stats[n]['short']['win_rate'],3),'n20':stats[n]['short']['total'],
+          'w50':round(stats[n]['mid']['win_rate'],3),'n50':stats[n]['mid']['total'],
+          'valid':stats[n]['valid']} for n in STRATEGY_NAMES if n in stats),
+        key=lambda x:x['score'],reverse=True
+    )
+    fusion.update({
+        'prediction':final,'raw_prediction':raw,'confidence':display,'percent':display,
+        'model_confidence':model_conf,'strategy_champion':champion,
+        'strategy_predictions':{k:v['prediction'] for k,v in preds.items()},
+        'strategy_reasons':{k:v['reason'] for k,v in preds.items()},
+        'strategy_rankings':rank,'recovery_mode':bool(recovery),'reverse_mode':bool(reverse_mode),'mode':mode,
+        'anti_tai':anti['anti_tai'],'anti_xiu':anti['anti_xiu'],
+        'normal_win_rate':round(recent['normal_win_rate'],4),'reverse_win_rate':round(recent['reverse_win_rate'],4),
+        'final_loss_streak':recent['loss_streak'],'status':_status_from_conf(model_conf,st),
+        'engine':'CHAMPION STRATEGY + FUSION V32','totalStrategies':len(STRATEGY_NAMES),'updated_at':time.time()
+    })
+    return fusion
+
+def log_strategy_predictions(board,session,model):
+    preds=(model or {}).get('strategy_predictions') or {}
+    if not preds: return
+    now=time.time()
+    with sqlite3.connect(DB_PATH) as db:
+        for name,pred in preds.items():
+            if name not in STRATEGY_NAMES or pred not in ('TÀI','XỈU'): continue
+            db.execute(
+                '''INSERT INTO strategy_logs(board,session,strategy,prediction,created_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(board,session,strategy) DO UPDATE SET prediction=excluded.prediction''',
+                (board,str(session),name,pred,now)
+            )
+        db.commit()
+
+def settle_strategy_predictions(board,session,actual):
+    if actual not in ('TÀI','XỈU'): return
+    now=time.time()
+    with sqlite3.connect(DB_PATH) as db:
+        rows=db.execute('SELECT strategy,prediction FROM strategy_logs WHERE board=? AND session=?',(board,str(session))).fetchall()
+        for name,pred in rows:
+            db.execute(
+                '''UPDATE strategy_logs SET actual=?,ok=?,settled_at=?
+                   WHERE board=? AND session=? AND strategy=?''',
+                (actual,1 if pred==actual else 0,now,board,str(session),name)
+            )
+        db.commit()
+
 
 
 async def store_rows(board, rows):
@@ -978,6 +1267,8 @@ def _settle_predictions(board, rows):
                        (act,ok,now,board,str(session)))
             settled.append({'session':str(session),'prediction':pred,'actual':act,'ok':bool(ok)})
         db.commit()
+    for item in settled:
+        settle_strategy_predictions(board,item['session'],item['actual'])
     return settled
 
 
@@ -1026,6 +1317,7 @@ def _create_shared_prediction(board, rows, current_session=None):
         db.execute('''INSERT INTO shared_predictions(board,session,prediction,confidence,score,model_json,created_at)
                       VALUES(?,?,?,?,?,?,?)''',(board,session,model['prediction'],model['confidence'],model['score'],json.dumps(model,ensure_ascii=False),now))
         db.commit()
+    log_strategy_predictions(board,session,model)
     return {'session':session,'prediction':model['prediction'],'confidence':model['confidence'],'score':model['score'],
             'model':model,'created_at':now,'actual':None,'ok':None,'settled_at':None},True
 
@@ -1162,7 +1454,8 @@ def board_label(board):
       'gb68:hu':'68GB HŨ','gb68:md5':'68GB MD5',
       'b52:hu':'B52 HŨ','b52:md5':'B52 MD5',
       'max789:hu':'MAX789 HŨ','max789:md5':'MAX789 MD5',
-      'son789:hu':'SON789 HŨ','son789:md5':'SON789 MD5'
+      'son789:hu':'SON789 HŨ','son789:md5':'SON789 MD5',
+      'hitclub:hu':'HITCLUB HŨ','hitclub:md5':'HITCLUB MD5'
     }
     if board.startswith('baccarat:') and board!='baccarat:main': return 'BACCARAT · '+board.split(':',1)[1]
     return labels.get(board,board.upper())
@@ -1330,7 +1623,7 @@ def locked_text(chat_id,feature):
 
 
 def admin_help():
-    return ('🛠 ADMIN V29 · NỀN 24/7\n'
+    return ('🛠 ADMIN V32 · HITCLUB + CHAMPION\n'
             '━━ CẤP QUYỀN ━━\n'
             '/grant <id> · BASIC = dự đoán\n'
             '/grantpro <id> · PRO = dự đoán + lịch sử + auto\n'
@@ -1349,7 +1642,7 @@ def admin_help():
             '/testapi <board> · /apis\n'
             '/setapi <board> <current_url> [history_url]\n'
             '/resetapi <board>\n'
-            'VD board: sunwin:sicbo · lc79:xocdia · max789:md5 · son789:hu')
+            'VD board: hitclub:hu · hitclub:md5 · sunwin:sicbo · lc79:xocdia · max789:md5')
 
 
 def user_help(chat_id):
@@ -1366,7 +1659,7 @@ def user_help(chat_id):
 def admin_health_text():
     with sqlite3.connect(DB_PATH) as db:
         state={b:(u,ok,err) for b,u,ok,err in db.execute('SELECT board,updated_at,source_ok,last_error FROM board_state')}
-    now=time.time();lines=['🩺 API HEALTH · V29']
+    now=time.time();lines=['🩺 API HEALTH · V32']
     for b in BOARDS:
         u,ok,err=state.get(b,(0,0,'chưa có dữ liệu'))
         age=max(0,int(now-u)) if u else -1
@@ -1389,7 +1682,7 @@ def admin_stats_text():
         wins=db.execute('SELECT COUNT(*) FROM shared_predictions WHERE ok=1').fetchone()[0]
         boards=db.execute('SELECT COUNT(DISTINCT board) FROM rounds').fetchone()[0]
     hit=(wins/settled*100) if settled else 0.0
-    return (f"📊 STATS V29\nUser mở: {active}/{users} · AI {ai_users} · LS {hist_users} · AUTO {auto_users}\n"
+    return (f"📊 STATS V32\nUser mở: {active}/{users} · AI {ai_users} · LS {hist_users} · AUTO {auto_users}\n"
             f"Board có dữ liệu: {boards}\nRound đang lưu: {rounds}\n"
             f"Prediction: {preds} · đã chốt {settled}\n"
             f"Đúng lịch sử: {wins}/{settled} ({hit:.1f}%)\n"
@@ -1410,6 +1703,9 @@ def engine_diag_text(board):
     if ml.get('ready'):
         lines.append(f"Online ML: P(TÀI) {round(ml.get('p_tai',.5)*100)}% · val {round(ml.get('val_accuracy',.5)*100)}% · Brier {ml.get('brier',.25)}")
     else:lines.append('Online ML: đang tích mẫu')
+    if m.get('strategy_champion'):
+        lines.append(f"Champion: {m.get('strategy_champion')} · {m.get('mode','FORCED')} · {m.get('status','---')}")
+        lines.append(f"Normal W20: {round(float(m.get('normal_win_rate',.5))*100,1)}% · Reverse: {round(float(m.get('reverse_win_rate',.5))*100,1)}%")
     if top:
         lines.append('Top signal: '+', '.join(f"{x['name']}({x['score']:+.2f})" for x in top[:6]))
     return '\n'.join(lines)[:4000]
@@ -1434,9 +1730,9 @@ async def admin_test_api(client,board):
 
 GAME_TITLES={
     'sunwin':'☀️ SUNWIN','lc79':'🎲 LC79','betvip':'💎 BETVIP','gb68':'🎰 68GB',
-    'b52':'🅱️ B52','max789':'👑 MAX789','son789':'✨ SON789','baccarat':'🃏 BACCARAT'
+    'b52':'🅱️ B52','max789':'👑 MAX789','son789':'✨ SON789','hitclub':'🔥 HITCLUB','baccarat':'🃏 BACCARAT'
 }
-GAME_ORDER=('sunwin','lc79','max789','son789','gb68','betvip','b52','baccarat')
+GAME_ORDER=('sunwin','lc79','hitclub','max789','son789','gb68','betvip','b52','baccarat')
 
 
 def boards_for_game(game):
@@ -1689,7 +1985,7 @@ def build_timeout_report(run):
     report={'type':'TAIXIUTOOL_AUTO_TRAIN_2H_REPORT','version':'V28','run_id':run['id'],
             'admin_chat_id':run['admin_chat_id'],'started_at':start,'ends_at':end,
             'duration_seconds':int(end-start),'generated_at':time.time(),
-            'engine':'GPT-DEEP + AI-FUSION V29','boards':{},
+            'engine':'CHAMPION STRATEGY + FUSION V32','boards':{},
             'totals':{'boards':0,'new_rounds':0,'predictions':0,'settled':0,'wins':0,'losses':0,'pending':0}}
     for board in available_bot_boards():
         rows=load_rows(board,MAX_HISTORY);before=set(str(x) for x in snapshot.get(board,[]))
@@ -1829,41 +2125,40 @@ def format_prediction(board,pred):
     model=pred.get('model') or {}
     st=history_stats(board,20)
     acc=f"{st['accuracy']}%" if st['accuracy'] is not None else '--'
-    text=(f"🎯 {board_label(board)} · #{pred.get('session','---')}\n"
-          f"{display_pred(board,pred.get('prediction'))} · tín hiệu {pred.get('confidence',50)}%\n"
-          f"📊 W20: ✅{st['wins']} ❌{st['losses']} · {acc}\n"
-          f"🧩 {model.get('pattern','---')} · học {model.get('sample',0)} phiên")
-
+    recent=get_prediction_history(board,8)
+    last=next((x for x in recent if x.get('actual') is not None),None)
+    lines=[f"🎮 {board_label(board)}"]
+    if last:
+        mark='✅ ĐÚNG' if last.get('ok') else '❌ SAI'
+        actual=display_pred(board,last.get('actual'))
+        prev_pred=display_pred(board,last.get('prediction'))
+        lines.append(f"↩️ PHIÊN TRƯỚC #{last.get('session')} · {mark}")
+        lines.append(f"ĐT {prev_pred} → KQ {actual}")
+        d=last.get('dice') or []
+        if len(d)>=3:
+            total=last.get('sum')
+            lines.append(f"🎲 {d[0]} · {d[1]} · {d[2]} = {total if total is not None else sum(d[:3])}")
+        elif last.get('sum') is not None:
+            lines.append(f"🎲 Tổng: {last.get('sum')}")
+        lines.append('')
+    lines.append(f"🎯 PHIÊN MỚI #{pred.get('session','---')}")
+    lines.append(f"→ {display_pred(board,pred.get('prediction'))} · tín hiệu {pred.get('confidence',50)}%")
+    lines.append(f"📊 W20: ✅{st['wins']} ❌{st['losses']} · {acc}")
+    lines.append(f"🧩 {model.get('pattern','---')} · học {model.get('sample',0)} phiên")
+    if model.get('strategy_champion'):
+        lines.append(f"🏆 {model.get('strategy_champion')} · {model.get('mode','FORCED')} · {model.get('status','---')}")
     df=model.get('dice_forecast') or {}
     if board=='sunwin:sicbo':
         if df.get('ready'):
             faces=df.get('faces',[])[:3]
             fv=' · '.join(str(x.get('face','?')) for x in faces)
-            vals=df.get('validation') or []
-            vv='/'.join(str(round(float(x)*100))+'%' for x in vals[:3]) if vals else '--'
-            text+=(f"\n🎲 Sicbo vị: {fv} · vùng tổng {df.get('sum_zone','---')}"
-                   f"\n↳ kiểm định vị: {vv} · chất lượng {round(float(df.get('quality',0))*100)}%")
+            lines.append(f"🎲 Sicbo vị dự kiến: {fv} · vùng tổng {df.get('sum_zone','---')}")
         else:
-            text+=f"\n🎲 Sicbo vị: đang học ({df.get('sample',0)}/18 phiên)"
-
+            lines.append(f"🎲 Sicbo vị: đang học ({df.get('sample',0)}/18 phiên)")
     xf=model.get('xocdia_forecast') or {}
     if board=='lc79:xocdia' and xf:
-        text+=f"\n🔴⚪ {xf.get('label','---')}"
-
-    # 3 prediction rows newest settled/pending for a compact audit trail.
-    recent=get_prediction_history(board,4)
-    if recent:
-        mini=[]
-        for x in recent:
-            if str(x.get('session'))==str(pred.get('session')) and x.get('actual') is None:
-                continue
-            mark='⏳' if x.get('actual') is None else ('✅' if x.get('ok') else '❌')
-            actual='…' if x.get('actual') is None else display_pred(board,x.get('actual'))
-            mini.append(f"{mark}#{x.get('session')} {display_pred(board,x.get('prediction'))}→{actual}")
-            if len(mini)>=3: break
-        if mini:
-            text+="\n📜 "+' | '.join(mini)
-    return text[:4000]
+        lines.append(f"🔴⚪ {xf.get('label','---')}")
+    return '\n'.join(lines)[:4000]
 
 
 def format_history(board,limit=15):
@@ -2255,7 +2550,7 @@ async def bot_handle_message(client,msg):
         b=text.split(maxsplit=1)[1].strip()
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':await admin_test_api(client,b)}); return
     if is_admin(chat_id) and text.startswith('/apis'):
-        lines=['🔗 API V29']
+        lines=['🔗 API V32']
         for b,c in BOARDS.items():
             ec=effective_cfg(b,c); lines.append(f"{b}\n→ {ec.get('current','-')}"+(f"\nH {ec.get('history')}" if ec.get('history') else ''))
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'\n'.join(lines)[:4000],'reply_markup':bot_admin_keyboard()}); return
@@ -2466,12 +2761,12 @@ async def lifespan(app: FastAPI):
             try: await task
             except BaseException: pass
 
-app=FastAPI(title='TAIXIUTOOL V29 Forever Background API', lifespan=lifespan)
+app=FastAPI(title='TAIXIUTOOL V32 HitClub Champion API', lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_credentials=False,allow_methods=['GET'],allow_headers=['*'])
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'admin_count':len(ADMIN_IDS),'max_history':MAX_HISTORY,'chatgpt_enabled':bool(OPENAI_API_KEY and OPENAI_MODEL),'engine':'GPT-DEEP + AI-FUSION V29','background':background_status_payload(),'sync_version':'V29_SERVER_ONLY'}
+    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'admin_count':len(ADMIN_IDS),'max_history':MAX_HISTORY,'chatgpt_enabled':bool(OPENAI_API_KEY and OPENAI_MODEL),'engine':'CHAMPION STRATEGY + FUSION V32','background':background_status_payload(),'sync_version':'V32_HITCLUB_CHAMPION'}
 
 @app.get('/api/learn/{game}/{table}')
 def learn(game:str, table:str, limit:int=Query(1000,ge=20,le=1000), sub:str|None=None):
@@ -2523,7 +2818,7 @@ def api_sync_all(limit:int=Query(80,ge=20,le=240)):
         boards[board]={'rows':rows,'model':model,'state':state,
                        'shared_prediction':get_shared_prediction(board),
                        'prediction_history':get_prediction_history(board,20)}
-    return {'ok':True,'server_time':time.time(),'engine':'GPT-DEEP + AI-FUSION V29',
+    return {'ok':True,'server_time':time.time(),'engine':'CHAMPION STRATEGY + FUSION V32',
             'poll_seconds':POLL_SECONDS,'source_of_truth':'railway',
             'sync_id':int(_last_cycle*1000) if _last_cycle else 0,
             'boards':boards,'background':background_status_payload()}
