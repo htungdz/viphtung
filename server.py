@@ -264,9 +264,10 @@ def parse_tx(data):
             'i':pick(o,['i'])
         }
         meta={k:v for k,v in meta.items() if v is not None}
-        out.append({'id':str(sid(o,i+1)),'result':r,'dice':d,'sum':t,
+        raw_sid=sid(o,i+1)
+        out.append({'id':canonical_session(raw_sid,i+1),'result':r,'dice':d,'sum':t,
                     'md5':pick(o,['md5','hash','md5_hash','md5Hash','hash_md5','md5Code','md5_code','md5_result','md5_enc','md5_dec']),
-                    'meta':meta or None})
+                    'meta':dict(meta or {},raw_session=str(raw_sid) if raw_sid is not None else None)})
     def key(x):
         try: return (0,int(x['id']))
         except: return (1,x['id'])
@@ -332,8 +333,9 @@ def parse_xocdia(data):
         norm=[str(x).lower() for x in colors]
         red=sum(1 for x in norm if 'do'==x or 'đỏ' in x or x=='red')
         white=sum(1 for x in norm if 'trang'==x or 'trắng' in x or x=='white')
+        raw_sid=sid(o,i+1)
         rows.append({
-            'id':str(sid(o,i+1)),'result':result,'dice':[],'sum':red,
+            'id':canonical_session(raw_sid,i+1),'result':result,'dice':[],'sum':red,
             'md5':pick(o,['md5','md5_raw','hash']),
             'meta':{'colors':norm[:4],'red_count':red,'white_count':white,
                     'detail':pick(o,['ket_qua_chi_tiet','ket_qua_chi_tiet_goc']),
@@ -672,7 +674,7 @@ def model_snapshot(rows, game=None, board=None):
     if len(seq)<6:
         return {'sample':len(seq),'score':0.0,'prediction':None,'confidence':50,'percent':50,
                 'pattern':'ĐANG HỌC','alt':'Chưa đủ mẫu','entropy':round(_entropy(seq),4),
-                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'CHAMPION STRATEGY + FUSION V32',
+                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'CHAMPION 15 STRATEGY + FUSION V33',
                 'skills':0,'totalSkills':60,'ml':{'ready':False},'updated_at':time.time()}
     vote=lambda x: 1 if x=='TÀI' else -1
     n=len(seq); comps=[]
@@ -918,7 +920,7 @@ def model_snapshot(rows, game=None, board=None):
     return {'sample':n,'score':round(score,4),'prediction':pred,'confidence':conf,'percent':conf,
             'run':run,'pattern':pattern,'alt':alt,'entropy':round(H,4),
             'cycle':{'k':lag,'r':round(best,4)},'agreement':round(agreement,4),
-            'engine':'CHAMPION STRATEGY + FUSION V32','skills':len(active),'totalSkills':60,
+            'engine':'CHAMPION 15 STRATEGY + FUSION V33','skills':len(active),'totalSkills':60,
             'ml':ml,'top_signals':top_signals,'updated_at':time.time()}
 
 # V32: V31 fusion becomes one candidate strategy instead of the only final decider.
@@ -927,7 +929,8 @@ fusion_model_snapshot = model_snapshot
 STRATEGY_NAMES = (
     'FOLLOW_LAST','REVERSE_LAST','ALTERNATING_PATTERN','RUN_BREAK','RUN_FOLLOW',
     'BIAS_MEAN_REVERSION','BIAS_MOMENTUM','MARKOV_TRANSITION','ANTI_RAW',
-    'HIGH_ORDER_MARKOV','SUFFIX_CONTEXT','FUSION_CORE'
+    'HIGH_ORDER_MARKOV','MARKOV_ORDER2','RUN_HAZARD','MULTI_WINDOW',
+    'SUFFIX_CONTEXT','FUSION_CORE'
 )
 
 def _opp(side):
@@ -993,6 +996,35 @@ def _anti_phase(board):
         elif raw=='XỈU': anti_tai+=1
     return {'wrong_rate':wrong/max(1,len(hist)),'anti_tai':anti_tai,'anti_xiu':anti_xiu,'sample':len(hist)}
 
+
+def _run_hazard_prediction(seq):
+    if not seq: return 'TÀI'
+    side=seq[-1]; cur=_run_len(seq)
+    follow=brk=1.0
+    for i in range(1,len(seq)):
+        if seq[i-1]!=side: continue
+        rl=1; j=i-2
+        while j>=0 and seq[j]==side and rl<8:
+            rl+=1; j-=1
+        if abs(rl-cur)>1: continue
+        if seq[i]==side: follow+=1
+        else: brk+=1
+    return side if follow>=brk else _opp(side)
+
+def _multi_window_prediction(seq):
+    if not seq: return 'TÀI'
+    vote=0.0
+    for w,weight in ((8,1.0),(16,1.15),(32,1.3),(64,1.1)):
+        q=seq[-w:]
+        if not q: continue
+        p=q.count('TÀI')/len(q)
+        if p>=.68: vote-=weight
+        elif p>=.54: vote+=weight
+        elif p<=.32: vote+=weight
+        elif p<=.46: vote-=weight
+    if abs(vote)<.1: return _markov_prediction(seq,2)
+    return 'TÀI' if vote>0 else 'XỈU'
+
 def _strategy_predictors(board,rows,fusion):
     seq=_seq(rows)
     if not seq: seq=['TÀI']
@@ -1020,6 +1052,9 @@ def _strategy_predictors(board,rows,fusion):
     put('MARKOV_TRANSITION',markov,53,'Markov chuyển trạng thái bậc 1')
     put('ANTI_RAW',_opp(fusion_pred) if raw_bad>=.55 else _opp(last),50+min(10,raw_bad*12),f'Wrong rate {raw_bad:.2f}')
     put('HIGH_ORDER_MARKOV',high,53,'Markov ngữ cảnh bậc 3')
+    put('MARKOV_ORDER2',_markov_prediction(seq,2),53,'Markov ngữ cảnh bậc 2')
+    put('RUN_HAZARD',_run_hazard_prediction(seq),52,'Xác suất tiếp/bẻ theo độ dài bệt')
+    put('MULTI_WINDOW',_multi_window_prediction(seq),52,'Bỏ phiếu W8/W16/W32/W64')
     put('SUFFIX_CONTEXT',_suffix_prediction(seq),52,'Suffix/motif context 2–6')
     put('FUSION_CORE',fusion_pred,int(fusion.get('confidence',50)),'V31 fusion core độc lập')
     return preds
@@ -1128,7 +1163,7 @@ def model_snapshot(rows, game=None, board=None):
     if not board: return fusion
     seq=_seq(rows)
     if len(seq)<2:
-        fusion['engine']='CHAMPION STRATEGY + FUSION V32'
+        fusion['engine']='CHAMPION 15 STRATEGY + FUSION V33'
         return fusion
     preds=_strategy_predictors(board,rows,fusion)
     champion,stats=select_champion(board,preds)
@@ -1159,7 +1194,7 @@ def model_snapshot(rows, game=None, board=None):
         'anti_tai':anti['anti_tai'],'anti_xiu':anti['anti_xiu'],
         'normal_win_rate':round(recent['normal_win_rate'],4),'reverse_win_rate':round(recent['reverse_win_rate'],4),
         'final_loss_streak':recent['loss_streak'],'status':_status_from_conf(model_conf,st),
-        'engine':'CHAMPION STRATEGY + FUSION V32','totalStrategies':len(STRATEGY_NAMES),'updated_at':time.time()
+        'engine':'CHAMPION 15 STRATEGY + FUSION V33','totalStrategies':len(STRATEGY_NAMES),'updated_at':time.time()
     })
     return fusion
 
@@ -1221,7 +1256,7 @@ def load_rows(board, limit=500):
         for s,r,d1,d2,d3,total,md5,seen,mj in db.execute('SELECT session,result,d1,d2,d3,total,md5,seen_at,meta_json FROM rounds WHERE board=?',(board,)):
             try: meta=json.loads(mj) if mj else {}
             except: meta={}
-            rid=canonical_session(s) if board=='sunwin:sicbo' else str(s)
+            rid=canonical_session(s,s)
             rows.append({'id':rid,'result':r,'dice':[x for x in (d1,d2,d3) if x is not None],
                          'sum':total,'md5':md5,'seen_at':seen,'meta':meta})
         return _stable_rows(rows)[-limit:]
@@ -1279,14 +1314,10 @@ def _current_anchor(current_rows):
     return str(max(nums)) if nums else None
 
 def _drop_stale_pending(board,target_session):
-    tn=_session_num(target_session)
-    if tn is None: return
-    with sqlite3.connect(DB_PATH) as db:
-        for (s,) in db.execute('SELECT session FROM shared_predictions WHERE board=? AND actual IS NULL',(board,)).fetchall():
-            sn=_session_num(s)
-            if sn is not None and sn!=tn:
-                db.execute('DELETE FROM shared_predictions WHERE board=? AND session=?',(board,str(s)))
-        db.commit()
+    # V33: keep unresolved predictions. History APIs can lag behind current APIs;
+    # deleting them caused SUNWIN history to vanish instead of settling later.
+    return
+
 
 def _create_shared_prediction(board, rows, current_session=None):
     if not rows: return None,False
@@ -1399,6 +1430,7 @@ async def poll_board(client, board, cfg):
             for table,rows in tables.items():
                 b=f'baccarat:{table}'
                 await store_rows(b,rows)
+                _settle_predictions(b,rows)
                 anchor=_current_anchor(rows)
                 await set_state(b,True)
                 await refresh_shared_prediction(b,anchor)
@@ -1416,7 +1448,9 @@ async def poll_board(client, board, cfg):
             if anchor is None:
                 raise current_pack if isinstance(current_pack,Exception) else RuntimeError('current API không có phiên hợp lệ')
             # History learns; current locks the live session. Never let stale history set the clock.
-            await store_rows(board,history_rows+current_rows)
+            live_rows=history_rows+current_rows
+            await store_rows(board,live_rows)
+            _settle_predictions(board,live_rows)
             await set_state(board,True)
             await refresh_shared_prediction(board,anchor)
             return
@@ -1428,6 +1462,7 @@ async def poll_board(client, board, cfg):
         anchor=_current_anchor(rows)
         if not rows or anchor is None: raise RuntimeError('current API không có phiên hợp lệ')
         await store_rows(board,rows)
+        _settle_predictions(board,rows)
         await set_state(board,True)
         await refresh_shared_prediction(board,anchor)
     except Exception as e:
@@ -1623,7 +1658,7 @@ def locked_text(chat_id,feature):
 
 
 def admin_help():
-    return ('🛠 ADMIN V32 · HITCLUB + CHAMPION\n'
+    return ('🛠 ADMIN V33 · HISTORY + CẦU\n'
             '━━ CẤP QUYỀN ━━\n'
             '/grant <id> · BASIC = dự đoán\n'
             '/grantpro <id> · PRO = dự đoán + lịch sử + auto\n'
@@ -1659,7 +1694,7 @@ def user_help(chat_id):
 def admin_health_text():
     with sqlite3.connect(DB_PATH) as db:
         state={b:(u,ok,err) for b,u,ok,err in db.execute('SELECT board,updated_at,source_ok,last_error FROM board_state')}
-    now=time.time();lines=['🩺 API HEALTH · V32']
+    now=time.time();lines=['🩺 API HEALTH · V33']
     for b in BOARDS:
         u,ok,err=state.get(b,(0,0,'chưa có dữ liệu'))
         age=max(0,int(now-u)) if u else -1
@@ -1682,7 +1717,7 @@ def admin_stats_text():
         wins=db.execute('SELECT COUNT(*) FROM shared_predictions WHERE ok=1').fetchone()[0]
         boards=db.execute('SELECT COUNT(DISTINCT board) FROM rounds').fetchone()[0]
     hit=(wins/settled*100) if settled else 0.0
-    return (f"📊 STATS V32\nUser mở: {active}/{users} · AI {ai_users} · LS {hist_users} · AUTO {auto_users}\n"
+    return (f"📊 STATS V33\nUser mở: {active}/{users} · AI {ai_users} · LS {hist_users} · AUTO {auto_users}\n"
             f"Board có dữ liệu: {boards}\nRound đang lưu: {rounds}\n"
             f"Prediction: {preds} · đã chốt {settled}\n"
             f"Đúng lịch sử: {wins}/{settled} ({hit:.1f}%)\n"
@@ -1739,6 +1774,43 @@ def boards_for_game(game):
     return [b for b in available_bot_boards() if b.split(':',1)[0]==game]
 
 
+def cau_token(board,result):
+    if board=='lc79:xocdia':
+        return 'C' if result=='TÀI' else 'L' if result=='XỈU' else '?'
+    if board.startswith('baccarat:'):
+        return 'P' if result=='TÀI' else 'B' if result=='XỈU' else '?'
+    return 'T' if result=='TÀI' else 'X' if result=='XỈU' else '?'
+
+def cau_icon(board,result):
+    if board=='lc79:xocdia':
+        return '⚪' if result=='TÀI' else '🟣'
+    if board.startswith('baccarat:'):
+        return '🔵' if result=='TÀI' else '🔴'
+    return '🔴' if result=='TÀI' else '🔵'
+
+def current_cau(board,limit=12):
+    rows=load_rows(board,max(20,limit))[-limit:]
+    vals=[r.get('result') for r in rows if r.get('result') in ('TÀI','XỈU')]
+    if not vals:return {'text':'---','icons':'','count':0}
+    return {'text':' '.join(cau_token(board,x) for x in vals),
+            'icons':' '.join(cau_icon(board,x) for x in vals),
+            'count':len(vals)}
+
+def game_cau_overview(game):
+    lines=[f"{GAME_TITLES.get(game,game)} · CẦU HIỆN TẠI"]
+    for b in boards_for_game(game):
+        c=current_cau(b,10)
+        label=board_label(b)
+        if game!='baccarat':
+            game_name=GAME_TITLES.get(game,game).split(' ',1)[-1]
+            label=label.replace(game_name+' ','')
+        else:
+            label=label.replace('BACCARAT · ','')
+        lines.append(f"• {label}: {c['text']}")
+        if c['icons']: lines.append(f"  {c['icons']}")
+    return '\n'.join(lines)[:3500]
+
+
 def bot_games_keyboard(chat_id):
     available={b.split(':',1)[0] for b in available_bot_boards()}
     buttons=[{'text':GAME_TITLES[g],'callback_data':'game|'+g} for g in GAME_ORDER if g in available]
@@ -1763,7 +1835,8 @@ def bot_game_keyboard(game,chat_id):
                 label=label.replace(game_name+' ','')
             else:
                 label=label.replace('BACCARAT · ','')
-            row.append({'text':f'{dot} {label}','callback_data':'sel|'+b})
+            c=current_cau(b,6)['text'].replace(' ','')
+            row.append({'text':f'{dot} {label} · {c}','callback_data':'sel|'+b})
         rows.append(row)
     rows.append([{'text':'⬅️ TẤT CẢ GAME','callback_data':'games'}])
     return {'inline_keyboard':rows}
@@ -1985,7 +2058,7 @@ def build_timeout_report(run):
     report={'type':'TAIXIUTOOL_AUTO_TRAIN_2H_REPORT','version':'V28','run_id':run['id'],
             'admin_chat_id':run['admin_chat_id'],'started_at':start,'ends_at':end,
             'duration_seconds':int(end-start),'generated_at':time.time(),
-            'engine':'CHAMPION STRATEGY + FUSION V32','boards':{},
+            'engine':'CHAMPION 15 STRATEGY + FUSION V33','boards':{},
             'totals':{'boards':0,'new_rounds':0,'predictions':0,'settled':0,'wins':0,'losses':0,'pending':0}}
     for board in available_bot_boards():
         rows=load_rows(board,MAX_HISTORY);before=set(str(x) for x in snapshot.get(board,[]))
@@ -2127,7 +2200,9 @@ def format_prediction(board,pred):
     acc=f"{st['accuracy']}%" if st['accuracy'] is not None else '--'
     recent=get_prediction_history(board,8)
     last=next((x for x in recent if x.get('actual') is not None),None)
-    lines=[f"🎮 {board_label(board)}"]
+    cau=current_cau(board,12)
+    lines=[f"🎮 {board_label(board)}",f"〽️ CẦU: {cau['text']}"]
+    if cau['icons']: lines.append(cau['icons'])
     if last:
         mark='✅ ĐÚNG' if last.get('ok') else '❌ SAI'
         actual=display_pred(board,last.get('actual'))
@@ -2550,7 +2625,7 @@ async def bot_handle_message(client,msg):
         b=text.split(maxsplit=1)[1].strip()
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':await admin_test_api(client,b)}); return
     if is_admin(chat_id) and text.startswith('/apis'):
-        lines=['🔗 API V32']
+        lines=['🔗 API V33']
         for b,c in BOARDS.items():
             ec=effective_cfg(b,c); lines.append(f"{b}\n→ {ec.get('current','-')}"+(f"\nH {ec.get('history')}" if ec.get('history') else ''))
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'\n'.join(lines)[:4000],'reply_markup':bot_admin_keyboard()}); return
@@ -2673,7 +2748,7 @@ async def bot_handle_callback(client,q):
         game=data.split('|',1)[1]
         if not boards_for_game(game):
             await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'Game chưa có bàn dữ liệu.'}); return
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':GAME_TITLES.get(game,game)+' · chọn bàn:',
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':game_cau_overview(game),
                                             'reply_markup':bot_game_keyboard(game,chat_id)}); return
 
     if data=='histall':
@@ -2761,12 +2836,12 @@ async def lifespan(app: FastAPI):
             try: await task
             except BaseException: pass
 
-app=FastAPI(title='TAIXIUTOOL V32 HitClub Champion API', lifespan=lifespan)
+app=FastAPI(title='TAIXIUTOOL V33 History Cau Pro API', lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_credentials=False,allow_methods=['GET'],allow_headers=['*'])
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'admin_count':len(ADMIN_IDS),'max_history':MAX_HISTORY,'chatgpt_enabled':bool(OPENAI_API_KEY and OPENAI_MODEL),'engine':'CHAMPION STRATEGY + FUSION V32','background':background_status_payload(),'sync_version':'V32_HITCLUB_CHAMPION'}
+    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'admin_count':len(ADMIN_IDS),'max_history':MAX_HISTORY,'chatgpt_enabled':bool(OPENAI_API_KEY and OPENAI_MODEL),'engine':'CHAMPION 15 STRATEGY + FUSION V33','background':background_status_payload(),'sync_version':'V33_HISTORY_CAU'}
 
 @app.get('/api/learn/{game}/{table}')
 def learn(game:str, table:str, limit:int=Query(1000,ge=20,le=1000), sub:str|None=None):
@@ -2775,13 +2850,13 @@ def learn(game:str, table:str, limit:int=Query(1000,ge=20,le=1000), sub:str|None
             board=f'baccarat:{sub}'
             rows=load_rows(board,limit)
             return {'game':game,'table':table,'sub':sub,'rows':rows,'model':model_snapshot(rows,game,board),
-                    'shared_prediction':get_shared_prediction(board),'prediction_history':get_prediction_history(board,20)}
+                    'shared_prediction':get_shared_prediction(board),'prediction_history':get_prediction_history(board,40)}
         with sqlite3.connect(DB_PATH) as db:
             names=[r[0].split(':',1)[1] for r in db.execute("SELECT DISTINCT board FROM rounds WHERE board LIKE 'baccarat:%' AND board<>'baccarat:main'")]
         tables={}
         for name in names:
             board=f'baccarat:{name}'; rows=load_rows(board,limit)
-            tables[name]={'rows':rows,'model':model_snapshot(rows,game,board),'shared_prediction':get_shared_prediction(board),'prediction_history':get_prediction_history(board,20)}
+            tables[name]={'rows':rows,'model':model_snapshot(rows,game,board),'shared_prediction':get_shared_prediction(board),'prediction_history':get_prediction_history(board,40)}
         return {'game':game,'table':table,'tables':tables}
     board=f'{game}:{table}'
     if board not in BOARDS:
@@ -2793,7 +2868,7 @@ def learn(game:str, table:str, limit:int=Query(1000,ge=20,le=1000), sub:str|None
         if row:
             state={'updated_at':row[0],'source_ok':bool(row[1]),'last_error':row[2], 'model':json.loads(row[3]) if row[3] else None}
     return {'game':game,'table':table,'rows':rows,'model':model_snapshot(rows,game,board),'state':state,
-            'shared_prediction':get_shared_prediction(board),'prediction_history':get_prediction_history(board,20)}
+            'shared_prediction':get_shared_prediction(board),'prediction_history':get_prediction_history(board,40)}
 
 @app.get('/api/background/status')
 def api_background_status():
@@ -2817,8 +2892,8 @@ def api_sync_all(limit:int=Query(80,ge=20,le=240)):
             state={'updated_at':st[0],'source_ok':bool(st[1]),'last_error':st[2]}
         boards[board]={'rows':rows,'model':model,'state':state,
                        'shared_prediction':get_shared_prediction(board),
-                       'prediction_history':get_prediction_history(board,20)}
-    return {'ok':True,'server_time':time.time(),'engine':'CHAMPION STRATEGY + FUSION V32',
+                       'prediction_history':get_prediction_history(board,40)}
+    return {'ok':True,'server_time':time.time(),'engine':'CHAMPION 15 STRATEGY + FUSION V33',
             'poll_seconds':POLL_SECONDS,'source_of_truth':'railway',
             'sync_id':int(_last_cycle*1000) if _last_cycle else 0,
             'boards':boards,'background':background_status_payload()}
@@ -2830,7 +2905,7 @@ def api_history_all():
         data[b]={
             'label':board_label(b),
             'stats':history_stats(b,100),
-            'prediction_history':get_prediction_history(b,20),
+            'prediction_history':get_prediction_history(b,40),
             'rounds':load_rows(b,20)
         }
     return {'ok':True,'source':'background-24x7','background':background_status_payload(),'boards':data}
