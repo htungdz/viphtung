@@ -70,6 +70,7 @@ _db_lock = asyncio.Lock()
 _worker_task = None
 _bot_task = None
 _last_cycle = 0.0
+_process_started_at = time.time()
 _ml_cache = {}
 
 
@@ -125,6 +126,28 @@ def ensure_db():
         db.execute('''CREATE TABLE IF NOT EXISTS api_overrides(
             board TEXT PRIMARY KEY, current_url TEXT, history_url TEXT, updated_at REAL NOT NULL
         )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS timeout_runs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_chat_id INTEGER NOT NULL,
+            started_at REAL NOT NULL,
+            ends_at REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            snapshot_json TEXT,
+            report_sent_at REAL,
+            cancelled_at REAL,
+            last_error TEXT
+        )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS background_service(
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            enabled INTEGER NOT NULL DEFAULT 1,
+            activated_at REAL NOT NULL,
+            activated_by INTEGER,
+            updated_at REAL NOT NULL
+        )''')
+        now=time.time()
+        db.execute('''INSERT OR IGNORE INTO background_service(id,enabled,activated_at,activated_by,updated_at)
+                      VALUES(1,1,?,NULL,?)''',(now,now))
+        db.execute("UPDATE timeout_runs SET status='retired_v29' WHERE status IN ('active','report_pending')")
         # Lightweight forward-compatible migration for richer game metadata.
         cols={r[1] for r in db.execute('PRAGMA table_info(rounds)').fetchall()}
         if 'meta_json' not in cols:
@@ -141,6 +164,18 @@ def pick(o: Any, keys):
 
 def sid(o, fallback=None):
     return pick(o,['phien','phiên','phien_id','phienId','id','session_id','sessionId','session','gameId','game_id','stt','code','index','issue','round','roundId','round_id','sid']) or fallback
+
+
+
+def canonical_session(v, fallback=None):
+    """Normalize numeric sessions such as '#2755690' -> '2755690'."""
+    if v is None:
+        v=fallback
+    if v is None:
+        return None
+    z=str(v).strip()
+    m=re.search(r'(\d+)(?!.*\d)',z)
+    return m.group(1) if m else z
 
 
 def dice_values(o):
@@ -221,6 +256,50 @@ def parse_tx(data):
     return out
 
 
+
+def parse_sicbo(data):
+    """Parser riêng SUNWIN Sicbo; chuẩn hóa #phiên và kiểm tra xúc xắc 1..6."""
+    out=[]
+    for i,o in enumerate(find_rows(data)):
+        if not isinstance(o,dict):
+            continue
+        d=dice_values(o)
+        if len(d)<3:
+            continue
+        try:
+            d=[int(x) for x in d[:3]]
+        except:
+            continue
+        if any(x<1 or x>6 for x in d):
+            continue
+        t=total_value(o,d)
+        if not isinstance(t,(int,float)) or int(t)<3 or int(t)>18:
+            t=sum(d)
+        else:
+            t=int(t)
+        r=tx_result(o,d,t)
+        if r not in ('TÀI','XỈU'):
+            continue
+        raw_sid=sid(o,i+1)
+        sess=canonical_session(raw_sid,i+1)
+        if not sess:
+            continue
+        out.append({
+            'id':sess,
+            'result':r,
+            'dice':d,
+            'sum':t,
+            'md5':pick(o,['md5','hash','md5_result']),
+            'meta':{
+                'source_game':pick(o,['game','name']) or 'sunwin',
+                'update_at':pick(o,['update_at','updated_at','last_update']),
+                'raw_session':str(raw_sid) if raw_sid is not None else None
+            }
+        })
+    out.sort(key=lambda x:(_session_num(x['id']) is None,_session_num(x['id']) or 0))
+    return out
+
+
 def parse_xocdia(data):
     rows=[]
     for i,o in enumerate(find_rows(data)):
@@ -250,38 +329,110 @@ def parse_xocdia(data):
 
 
 def dice_position_forecast(rows):
-    valid=[r for r in rows[-700:] if isinstance(r.get('dice'),list) and len(r.get('dice'))>=3]
-    if len(valid)<12:return {'ready':False,'sample':len(valid),'faces':[]}
-    faces=[]
-    for j in range(3):
-        last=int(valid[-1]['dice'][j]);prev2=tuple(int(r['dice'][j]) for r in valid[-2:])
-        scores={k:1.8 for k in range(1,7)}
-        for idx,r in enumerate(valid):
-            try:v=int(r['dice'][j])
-            except:continue
-            age=len(valid)-1-idx;scores[v]+=0.5**(age/46)
-        # order-1 transition
-        for idx in range(1,len(valid)):
-            try:prev=int(valid[idx-1]['dice'][j]);nxt=int(valid[idx]['dice'][j])
-            except:continue
-            if prev==last:
-                age=len(valid)-1-idx;scores[nxt]+=1.45*(0.5**(age/38))
-        # order-2 position motif
-        for idx in range(2,len(valid)):
-            try:ctx=(int(valid[idx-2]['dice'][j]),int(valid[idx-1]['dice'][j]));nxt=int(valid[idx]['dice'][j])
-            except:continue
-            if ctx==prev2:
-                age=len(valid)-1-idx;scores[nxt]+=1.15*(0.5**(age/44))
-        total_score=sum(scores.values())
+    """Ensemble vị Sicbo: decay-frequency + Markov1/2 + lag-cycle + sum-state.
+    `probability` là tỷ trọng model nội bộ, không phải xác suất thật của viên xúc xắc.
+    """
+    valid=[r for r in rows[-850:] if isinstance(r.get('dice'),list) and len(r.get('dice'))>=3]
+    valid=[r for r in valid if all(isinstance(x,(int,float)) and 1<=int(x)<=6 for x in r.get('dice')[:3])]
+    if len(valid)<18:
+        return {'ready':False,'sample':len(valid),'faces':[],'estimated_total':None,'sum_zone':'ĐANG HỌC'}
+
+    def fit_pos(hist,j):
+        last=int(hist[-1]['dice'][j])
+        prev2=tuple(int(r['dice'][j]) for r in hist[-2:])
+        scores={k:2.2 for k in range(1,7)}
+
+        # 1) recency-decayed face frequency
+        for idx,r in enumerate(hist):
+            v=int(r['dice'][j]); age=len(hist)-1-idx
+            scores[v]+=0.78*(0.5**(age/52))
+
+        # 2) Markov-1 transition from current face
+        ev1=0.0
+        for idx in range(1,len(hist)):
+            if int(hist[idx-1]['dice'][j])!=last: continue
+            nxt=int(hist[idx]['dice'][j]); age=len(hist)-1-idx
+            w=0.5**(age/44); scores[nxt]+=1.65*w; ev1+=w
+
+        # 3) Markov-2 on this position
+        ev2=0.0
+        for idx in range(2,len(hist)):
+            ctx=(int(hist[idx-2]['dice'][j]),int(hist[idx-1]['dice'][j]))
+            if ctx!=prev2: continue
+            nxt=int(hist[idx]['dice'][j]); age=len(hist)-1-idx
+            w=0.5**(age/48); scores[nxt]+=1.28*w; ev2+=w
+
+        # 4) strongest positive/inverse lag state
+        arr=[int(r['dice'][j]) for r in hist[-180:]]
+        best_lag=None; best_edge=0.0; best_face=None
+        for lag in (2,3,4,5,6,7,8,10,12):
+            if len(arr)<lag+28: continue
+            same=sum(1 for idx in range(lag,len(arr)) if arr[idx]==arr[idx-lag])
+            rate=same/max(1,len(arr)-lag)
+            edge=rate-(1/6)
+            if edge>best_edge:
+                best_edge=edge; best_lag=lag; best_face=arr[-lag]
+        if best_lag and best_edge>.035:
+            scores[best_face]+=min(1.6, .45+best_edge*6.0)
+
+        # 5) previous total band -> next face at this position
+        cur_sum=hist[-1].get('sum')
+        if isinstance(cur_sum,(int,float)):
+            band='L' if cur_sum<=8 else 'H' if cur_sum>=13 else 'M'
+            for idx in range(1,len(hist)):
+                ps=hist[idx-1].get('sum')
+                if not isinstance(ps,(int,float)): continue
+                pb='L' if ps<=8 else 'H' if ps>=13 else 'M'
+                if pb!=band: continue
+                nxt=int(hist[idx]['dice'][j]); age=len(hist)-1-idx
+                scores[nxt]+=.58*(0.5**(age/46))
+
+        total_score=sum(scores.values()) or 1.0
         ordered=sorted(scores.items(),key=lambda kv:kv[1],reverse=True)
         top,second=ordered[0],ordered[1]
-        strength=(top[1]-second[1])/max(.001,top[1]+second[1])
-        faces.append({'position':j+1,'face':top[0],'strength':round(strength,3),
-                      'probability':round(top[1]/total_score,3),
-                      'top3':[{'face':f,'p':round(sc/total_score,3)} for f,sc in ordered[:3]]})
-    est=sum(x['face'] for x in faces)
-    zone='3–8' if est<=8 else '9–10' if est<=10 else '11–12' if est<=12 else '13–18'
-    return {'ready':True,'sample':len(valid),'faces':faces,'estimated_total':est,'sum_zone':zone}
+        edge=(top[1]-second[1])/max(.001,top[1]+second[1])
+        mean=sum(face*sc for face,sc in scores.items())/total_score
+        return {
+            'position':j+1,
+            'face':top[0],
+            'expected':round(mean,3),
+            'strength':round(edge,3),
+            'model_share':round(top[1]/total_score,3),
+            'markov1_support':round(ev1,2),
+            'markov2_support':round(ev2,2),
+            'lag':best_lag or 0,
+            'top3':[{'face':f,'share':round(sc/total_score,3)} for f,sc in ordered[:3]]
+        }
+
+    faces=[fit_pos(valid,j) for j in range(3)]
+    expected_total=sum(x['expected'] for x in faces)
+    est_top=sum(x['face'] for x in faces)
+    zone='3–8' if expected_total<8.5 else '9–10' if expected_total<10.5 else '11–12' if expected_total<12.5 else '13–18'
+
+    # lightweight walk-forward top-1 validation on recent known rounds
+    checks=0; hits=[0,0,0]
+    start=max(18,len(valid)-90)
+    step=3  # keep CPU light while polling
+    for idx in range(start,len(valid),step):
+        hist=valid[:idx]
+        if len(hist)<18: continue
+        for j in range(3):
+            pred=fit_pos(hist,j)['face']
+            hits[j]+=int(pred==int(valid[idx]['dice'][j]))
+        checks+=1
+    validation=[round(h/max(1,checks),3) for h in hits]
+
+    # reliability shrinks when top-1 validation is no better than the 1/6 baseline
+    rel=sum(max(0.0,v-(1/6)) for v in validation)/3
+    overall_strength=sum(x['strength'] for x in faces)/3
+    quality=_clamp(.15 + rel*2.6 + overall_strength*1.8,.15,.78)
+
+    return {
+        'ready':True,'sample':len(valid),'faces':faces,
+        'estimated_total_top':est_top,'expected_total':round(expected_total,2),
+        'sum_zone':zone,'validation':validation,'checks':checks,
+        'quality':round(quality,3)
+    }
 
 
 def xocdia_detail_forecast(rows, binary_prediction):
@@ -503,7 +654,7 @@ def model_snapshot(rows, game=None, board=None):
     if len(seq)<6:
         return {'sample':len(seq),'score':0.0,'prediction':None,'confidence':50,'percent':50,
                 'pattern':'ĐANG HỌC','alt':'Chưa đủ mẫu','entropy':round(_entropy(seq),4),
-                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'GPT-DEEP + AI-FUSION V25',
+                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'GPT-DEEP + AI-FUSION V29',
                 'skills':0,'totalSkills':60,'ml':{'ready':False},'updated_at':time.time()}
     vote=lambda x: 1 if x=='TÀI' else -1
     n=len(seq); comps=[]
@@ -695,6 +846,18 @@ def model_snapshot(rows, game=None, board=None):
                     ev+=w
                 if ev>=2.0:add(f'pos{pos+1}face',(p-x)/(p+x),.54)
 
+        # Sicbo-only position/total expectation expert.
+        if board=='sunwin:sicbo' and len(valid)>=24:
+            try:
+                df=dice_position_forecast(valid)
+                if df.get('ready'):
+                    exp=float(df.get('expected_total',10.5))
+                    q=float(df.get('quality',.2))
+                    # Small expert only; exact dice are inherently noisy.
+                    add('sicbo_possum',_clamp((exp-10.5)/5.5,-.55,.55),.36+.28*q)
+            except:
+                pass
+
         # Weak crowd-flow expert if source exposes totals; never treated as ground truth.
         meta=valid[-1].get('meta') or {}
         try:
@@ -737,7 +900,7 @@ def model_snapshot(rows, game=None, board=None):
     return {'sample':n,'score':round(score,4),'prediction':pred,'confidence':conf,'percent':conf,
             'run':run,'pattern':pattern,'alt':alt,'entropy':round(H,4),
             'cycle':{'k':lag,'r':round(best,4)},'agreement':round(agreement,4),
-            'engine':'GPT-DEEP + AI-FUSION V25','skills':len(active),'totalSkills':60,
+            'engine':'GPT-DEEP + AI-FUSION V29','skills':len(active),'totalSkills':60,
             'ml':ml,'top_signals':top_signals,'updated_at':time.time()}
 
 
@@ -769,7 +932,8 @@ def load_rows(board, limit=500):
         for s,r,d1,d2,d3,total,md5,seen,mj in db.execute('SELECT session,result,d1,d2,d3,total,md5,seen_at,meta_json FROM rounds WHERE board=?',(board,)):
             try: meta=json.loads(mj) if mj else {}
             except: meta={}
-            rows.append({'id':str(s),'result':r,'dice':[x for x in (d1,d2,d3) if x is not None],
+            rid=canonical_session(s) if board=='sunwin:sicbo' else str(s)
+            rows.append({'id':rid,'result':r,'dice':[x for x in (d1,d2,d3) if x is not None],
                          'sum':total,'md5':md5,'seen_at':seen,'meta':meta})
         return _stable_rows(rows)[-limit:]
 
@@ -966,7 +1130,9 @@ async def poll_board(client, board, cfg):
             return
 
         data,_=await fetch_first(client,[cfg.get('current')]+cfg.get('current_fallbacks',[]))
-        rows=parse_xocdia(data) if cfg['kind']=='xocdia' else parse_tx(data)
+        rows=(parse_xocdia(data) if cfg['kind']=='xocdia'
+              else parse_sicbo(data) if cfg['kind']=='sicbo'
+              else parse_tx(data))
         anchor=_current_anchor(rows)
         if not rows or anchor is None: raise RuntimeError('current API không có phiên hợp lệ')
         await store_rows(board,rows)
@@ -1164,16 +1330,21 @@ def locked_text(chat_id,feature):
 
 
 def admin_help():
-    return ('🛠 ADMIN V25 · COMPACT CONTROL\n'
+    return ('🛠 ADMIN V29 · NỀN 24/7\n'
             '━━ CẤP QUYỀN ━━\n'
             '/grant <id> · BASIC = dự đoán\n'
             '/grantpro <id> · PRO = dự đoán + lịch sử + auto\n'
             '/grantvip <id> · VIP = full + GPT\n'
             '/permit <id> <predict|history|ai|auto>\n'
             '/deny <id> <predict|history|ai|auto>\n'
-            '/perms <id> · xem quyền · /revoke <id>\n'
+            '/perms <id> · xem quyền\n'
+            '/lock <id> · tắt toàn bộ user\n'
+            '/unlock <id> [basic|pro|vip] · mở lại\n'
+            '/revoke <id> · alias /lock\n'
             '/users · danh sách user\n'
             '━━ HỆ THỐNG ━━\n'
+            '/background · xem trạng thái nền 24/7\n'
+            '/start · mở menu; nền 24/7 vẫn tự chạy\n'
             '/health · /stats · /engine [board] · /deep [board]\n'
             '/testapi <board> · /apis\n'
             '/setapi <board> <current_url> [history_url]\n'
@@ -1184,7 +1355,10 @@ def admin_help():
 def user_help(chat_id):
     p=get_permissions(chat_id)
     lines=['📖 LỆNH BOT','/games · chọn game/bàn','/status · xem dự đoán','/me · xem quyền','/id · xem User ID']
-    if p.get('history'): lines.append('/history · lịch sử')
+    if p.get('history'):
+        lines.append('/history · lịch sử đúng/sai')
+        lines.append('/results · kết quả game')
+        lines.append('/historyall · lịch sử tất cả game')
     if p.get('ai'): lines.append('/ai · GPT Deep Analysis')
     if p.get('auto'): lines.append('/auto · bật/tắt AUTO bàn đang chọn')
     return '\n'.join(lines)
@@ -1192,7 +1366,7 @@ def user_help(chat_id):
 def admin_health_text():
     with sqlite3.connect(DB_PATH) as db:
         state={b:(u,ok,err) for b,u,ok,err in db.execute('SELECT board,updated_at,source_ok,last_error FROM board_state')}
-    now=time.time();lines=['🩺 API HEALTH · V25']
+    now=time.time();lines=['🩺 API HEALTH · V29']
     for b in BOARDS:
         u,ok,err=state.get(b,(0,0,'chưa có dữ liệu'))
         age=max(0,int(now-u)) if u else -1
@@ -1215,7 +1389,7 @@ def admin_stats_text():
         wins=db.execute('SELECT COUNT(*) FROM shared_predictions WHERE ok=1').fetchone()[0]
         boards=db.execute('SELECT COUNT(DISTINCT board) FROM rounds').fetchone()[0]
     hit=(wins/settled*100) if settled else 0.0
-    return (f"📊 STATS V25\nUser mở: {active}/{users} · AI {ai_users} · LS {hist_users} · AUTO {auto_users}\n"
+    return (f"📊 STATS V29\nUser mở: {active}/{users} · AI {ai_users} · LS {hist_users} · AUTO {auto_users}\n"
             f"Board có dữ liệu: {boards}\nRound đang lưu: {rounds}\n"
             f"Prediction: {preds} · đã chốt {settled}\n"
             f"Đúng lịch sử: {wins}/{settled} ({hit:.1f}%)\n"
@@ -1275,6 +1449,8 @@ def bot_games_keyboard(chat_id):
     rows=[buttons[i:i+2] for i in range(0,len(buttons),2)]
     if feature_allowed(chat_id,'auto'):
         rows.append([{'text':'✅ AUTO ALL','callback_data':'allon'},{'text':'⛔ TẮT ALL','callback_data':'alloff'}])
+    if get_permissions(chat_id).get('history'):
+        rows.append([{'text':'📚 LỊCH SỬ ALL','callback_data':'histall'}])
     rows.append([{'text':'🔐 QUYỀN','callback_data':'perm'},{'text':'📖 LỆNH','callback_data':'help'}])
     return {'inline_keyboard':rows}
 
@@ -1307,58 +1483,410 @@ def bot_board_keyboard(board,chat_id=None):
     ]
     on=sub_enabled(chat_id,board) if chat_id is not None and p.get('auto') else False
     r2=[
-        {'text':'📜 LỊCH SỬ' if p.get('history') else '🔒 LỊCH SỬ',
+        {'text':'📜 ĐÚNG/SAI' if p.get('history') else '🔒 ĐÚNG/SAI',
          'callback_data':(('hist|' if p.get('history') else 'locked|history|')+board)},
+        {'text':'🧾 KQ GAME' if p.get('history') else '🔒 KQ GAME',
+         'callback_data':(('rounds|' if p.get('history') else 'locked|history|')+board)}
+    ]
+    r3=[
         {'text':('🔕 TẮT AUTO' if on else '🔔 BẬT AUTO') if p.get('auto') else '🔒 AUTO',
-         'callback_data':(('auto|' if p.get('auto') else 'locked|auto|')+board)}
+         'callback_data':(('auto|' if p.get('auto') else 'locked|auto|')+board)},
+        {'text':'📚 LS ALL' if p.get('history') else '🔒 LS ALL',
+         'callback_data':'histall' if p.get('history') else 'locked|history|'+board}
     ]
     game=board.split(':',1)[0]
-    r3=[{'text':'⬅️ '+GAME_TITLES.get(game,game),'callback_data':'game|'+game},
+    r4=[{'text':'⬅️ '+GAME_TITLES.get(game,game),'callback_data':'game|'+game},
         {'text':'🎮 GAME','callback_data':'games'}]
-    return {'inline_keyboard':[r1,r2,r3]}
+    return {'inline_keyboard':[r1,r2,r3,r4]}
 
 
 def bot_admin_keyboard():
     return {'inline_keyboard':[
         [{'text':'👥 QUYỀN','callback_data':'adm|permhelp'},{'text':'📊 STATS','callback_data':'adm|stats'}],
-        [{'text':'🩺 API HEALTH','callback_data':'adm|health'},{'text':'🔗 API LINKS','callback_data':'adm|apis'}],
-        [{'text':'🧠 ENGINE','callback_data':'adm|engine'},{'text':'🧮 DEEP','callback_data':'adm|deep'}],
-        [{'text':'🎮 GAME MENU','callback_data':'games'}]
+        [{'text':'♾ NỀN 24/7','callback_data':'adm|background'},{'text':'🩺 API HEALTH','callback_data':'adm|health'}],
+        [{'text':'🔗 API LINKS','callback_data':'adm|apis'},{'text':'🧠 ENGINE','callback_data':'adm|engine'}],
+        [{'text':'🧮 DEEP','callback_data':'adm|deep'},{'text':'🎮 GAME MENU','callback_data':'games'}]
     ]}
 
+
+def history_stats(board,limit=100):
+    h=get_prediction_history(board,limit)
+    settled=[x for x in h if x.get('actual') is not None and x.get('ok') is not None]
+    wins=sum(1 for x in settled if x.get('ok'))
+    losses=len(settled)-wins
+    pending=sum(1 for x in h if x.get('actual') is None)
+    # result streak over settled items newest -> older
+    streak=0; streak_ok=None
+    for x in settled:
+        v=bool(x.get('ok'))
+        if streak_ok is None: streak_ok=v;streak=1
+        elif v==streak_ok: streak+=1
+        else: break
+    return {
+        'wins':wins,'losses':losses,'settled':len(settled),'pending':pending,
+        'accuracy':round(wins/len(settled)*100,1) if settled else None,
+        'streak':streak,'streak_ok':streak_ok
+    }
+
+
+def _round_line(board,r):
+    rid=str(r.get('id','---'))
+    side=display_pred(board,r.get('result'))
+    d=r.get('dice') or []
+    sm=r.get('sum')
+    extra=''
+    if len(d)>=3:
+        extra=f" · 🎲{d[0]}-{d[1]}-{d[2]}={sm if sm is not None else sum(d[:3])}"
+    elif board=='lc79:xocdia':
+        m=r.get('meta') or {}
+        red=m.get('red_count');white=m.get('white_count')
+        if isinstance(red,int):
+            extra=f" · 🔴{red}/⚪{white if isinstance(white,int) else 4-red}"
+    elif sm is not None:
+        extra=f" · tổng {sm}"
+    return f"#{rid} · {side}{extra}"
+
+
+def format_round_history(board,limit=12):
+    rows=load_rows(board,max(20,limit))[-limit:]
+    if not rows:
+        return f"🧾 {board_label(board)} · chưa có lịch sử kết quả."
+    lines=[f"🧾 KẾT QUẢ {board_label(board)} · {len(rows)} phiên"]
+    for r in reversed(rows):
+        lines.append(_round_line(board,r))
+    return '\n'.join(lines)[:4000]
+
+
+def format_all_history(limit_per_board=40):
+    lines=['📚 LỊCH SỬ ALL GAME · ĐÚNG/SAI']
+    count=0
+    for b in available_bot_boards():
+        st=history_stats(b,limit_per_board)
+        rows=load_rows(b,1)
+        last=rows[-1] if rows else None
+        if st['settled']==0 and not last:
+            continue
+        acc=f"{st['accuracy']}%" if st['accuracy'] is not None else '--'
+        streak=''
+        if st['streak']:
+            streak=f" · {'✅' if st['streak_ok'] else '❌'}x{st['streak']}"
+        last_txt=(f" · KQ #{last.get('id')} {display_pred(b,last.get('result'))}" if last else '')
+        lines.append(f"{board_label(b)} · ✅{st['wins']} ❌{st['losses']} · {acc}{streak}{last_txt}")
+        count+=1
+        if len('\n'.join(lines))>3600:
+            break
+    if count==0:
+        lines.append('Chưa có lịch sử.')
+    return '\n'.join(lines)[:4000]
+
+
+TIMEOUT_SECONDS=2*60*60
+
+def _timeout_row_to_dict(r):
+    if not r:return None
+    return {'id':r[0],'admin_chat_id':r[1],'started_at':r[2],'ends_at':r[3],
+            'status':r[4],'snapshot_json':r[5],'report_sent_at':r[6],
+            'cancelled_at':r[7],'last_error':r[8]}
+
+def get_timeout_run(active_only=True):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as db:
+        if active_only:
+            r=db.execute('''SELECT id,admin_chat_id,started_at,ends_at,status,snapshot_json,
+                                   report_sent_at,cancelled_at,last_error
+                            FROM timeout_runs
+                            WHERE status IN ('active','report_pending')
+                            ORDER BY id DESC LIMIT 1''').fetchone()
+        else:
+            r=db.execute('''SELECT id,admin_chat_id,started_at,ends_at,status,snapshot_json,
+                                   report_sent_at,cancelled_at,last_error
+                            FROM timeout_runs ORDER BY id DESC LIMIT 1''').fetchone()
+    return _timeout_row_to_dict(r)
+
+def timeout_training_active():
+    r=get_timeout_run(True)
+    return bool(r and r['status']=='active' and time.time()<float(r['ends_at']))
+
+def timeout_status_payload():
+    r=get_timeout_run(False)
+    if not r:return {'active':False,'status':'idle','remaining_seconds':0}
+    now=time.time()
+    active=r['status']=='active' and now<r['ends_at']
+    return {'active':active,'id':r['id'],'admin_chat_id':r['admin_chat_id'],
+            'started_at':r['started_at'],'ends_at':r['ends_at'],
+            'remaining_seconds':max(0,int(r['ends_at']-now)) if active else 0,
+            'status':r['status'],'report_sent_at':r['report_sent_at'],
+            'cancelled_at':r['cancelled_at'],'last_error':r['last_error']}
+
+def timeout_status_text():
+    p=timeout_status_payload()
+    if p['status']=='idle':
+        return '⏱ AUTO-TRAIN: chưa chạy.\nAdmin chỉ cần /start, bot sẽ tự học ngầm đúng 2 giờ.'
+    if p.get('active'):
+        rem=p['remaining_seconds'];hh=rem//3600;mm=(rem%3600)//60;ss=rem%60
+        return (f"⏱ AUTO-TRAIN #{p['id']} · ĐANG HỌC NGẦM\n"
+                f"Còn {hh:02d}:{mm:02d}:{ss:02d}\n"
+                "ALL GAME vẫn poll + tạo prediction + chốt đúng/sai.\n"
+                "AUTO Telegram tạm im lặng; web vẫn đồng bộ realtime.")
+    if p['status']=='report_pending':return f"⏱ AUTO-TRAIN #{p['id']} · đủ 2 giờ · đang tạo/gửi file."
+    if p['status']=='finished':return f"✅ TIMEOUT #{p['id']} · hoàn tất · file đã gửi admin."
+    if p['status']=='cancelled':return f"⛔ TIMEOUT #{p['id']} · đã hủy."
+    return f"⏱ AUTO-TRAIN #{p['id']} · {p['status']}"
+
+def _snapshot_sessions():
+    snap={}
+    with sqlite3.connect(DB_PATH) as db:
+        for board,session in db.execute('SELECT board,session FROM rounds'):
+            snap.setdefault(board,[]).append(str(session))
+    return snap
+
+def start_timeout_run(admin_chat_id):
+    current=get_timeout_run(True)
+    if current:return False,current
+    now=time.time();snap=_snapshot_sessions()
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute('''INSERT INTO timeout_runs(admin_chat_id,started_at,ends_at,status,snapshot_json)
+                      VALUES(?,?,?,?,?)''',
+                   (int(admin_chat_id),now,now+TIMEOUT_SECONDS,'active',json.dumps(snap,ensure_ascii=False)))
+        db.commit()
+    return True,get_timeout_run(True)
+
+def cancel_timeout_run(admin_chat_id):
+    r=get_timeout_run(True)
+    if not r:return False,None
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute("UPDATE timeout_runs SET status='cancelled',cancelled_at=?,last_error=NULL WHERE id=?",
+                   (time.time(),r['id']))
+        db.commit()
+    return True,get_timeout_run(False)
+
+def _timeout_prediction_rows(board,start,end):
+    with sqlite3.connect(DB_PATH) as db:
+        q=db.execute('''SELECT p.session,p.prediction,p.confidence,p.score,p.created_at,p.actual,p.ok,p.settled_at,
+                               r.d1,r.d2,r.d3,r.total,r.md5
+                        FROM shared_predictions p
+                        LEFT JOIN rounds r ON r.board=p.board AND r.session=p.session
+                        WHERE p.board=? AND p.created_at>=? AND p.created_at<=?
+                        ORDER BY p.created_at ASC''',(board,start,end))
+        out=[]
+        for session,pred,conf,score,created,actual,ok,settled,d1,d2,d3,total,md5 in q.fetchall():
+            out.append({'session':session,'prediction':display_pred(board,pred),'prediction_internal':pred,
+                        'confidence':conf,'score':score,'created_at':created,
+                        'actual':display_pred(board,actual) if actual else None,'actual_internal':actual,
+                        'ok':None if ok is None else bool(ok),'settled_at':settled,
+                        'dice':[x for x in (d1,d2,d3) if x is not None],'sum':total,'md5':md5})
+    return out
+
+def _timeout_source_state(board):
+    with sqlite3.connect(DB_PATH) as db:
+        r=db.execute('SELECT updated_at,source_ok,last_error FROM board_state WHERE board=?',(board,)).fetchone()
+    return {'updated_at':r[0],'source_ok':bool(r[1]),'last_error':r[2]} if r else None
+
+def build_timeout_report(run):
+    try:snapshot=json.loads(run.get('snapshot_json') or '{}')
+    except:snapshot={}
+    start=float(run['started_at']);end=float(run['ends_at'])
+    report={'type':'TAIXIUTOOL_AUTO_TRAIN_2H_REPORT','version':'V28','run_id':run['id'],
+            'admin_chat_id':run['admin_chat_id'],'started_at':start,'ends_at':end,
+            'duration_seconds':int(end-start),'generated_at':time.time(),
+            'engine':'GPT-DEEP + AI-FUSION V29','boards':{},
+            'totals':{'boards':0,'new_rounds':0,'predictions':0,'settled':0,'wins':0,'losses':0,'pending':0}}
+    for board in available_bot_boards():
+        rows=load_rows(board,MAX_HISTORY);before=set(str(x) for x in snapshot.get(board,[]))
+        new_rows=[]
+        for r in rows:
+            if str(r.get('id')) in before:continue
+            new_rows.append({'session':r.get('id'),'result':display_pred(board,r.get('result')),
+                             'result_internal':r.get('result'),'dice':r.get('dice') or [],
+                             'sum':r.get('sum'),'md5':r.get('md5'),'seen_at':r.get('seen_at'),
+                             'meta':r.get('meta') or {}})
+        preds=_timeout_prediction_rows(board,start,end)
+        settled=[x for x in preds if x['ok'] is not None]
+        wins=sum(1 for x in settled if x['ok']);losses=sum(1 for x in settled if not x['ok'])
+        pending=sum(1 for x in preds if x['ok'] is None)
+        cfg=effective_cfg(board,BOARDS.get(board,BOARDS.get('baccarat:main',{})))
+        model=model_snapshot(rows,board.split(':',1)[0],board) if rows else {}
+        report['boards'][board]={
+            'label':board_label(board),
+            'api':{'current':cfg.get('current'),'history':cfg.get('history'),
+                   'fallbacks':cfg.get('current_fallbacks',[])},
+            'source_state':_timeout_source_state(board),'new_rounds':new_rows,'predictions':preds,
+            'summary':{'new_rounds':len(new_rows),'predictions':len(preds),'settled':len(settled),
+                       'wins':wins,'losses':losses,'pending':pending,
+                       'accuracy':round(wins/len(settled)*100,2) if settled else None},
+            'model_end':{'sample':model.get('sample'),'pattern':model.get('pattern'),
+                         'prediction':display_pred(board,model.get('prediction')),
+                         'confidence':model.get('confidence'),'agreement':model.get('agreement'),
+                         'entropy':model.get('entropy'),'engine':model.get('engine'),'ml':model.get('ml',{})}}
+        report['totals']['boards']+=1;report['totals']['new_rounds']+=len(new_rows)
+        report['totals']['predictions']+=len(preds);report['totals']['settled']+=len(settled)
+        report['totals']['wins']+=wins;report['totals']['losses']+=losses;report['totals']['pending']+=pending
+    st=report['totals']['settled']
+    report['totals']['accuracy']=round(report['totals']['wins']/st*100,2) if st else None
+    return report
+
+def timeout_report_caption(report):
+    t=report['totals'];acc=f"{t.get('accuracy')}%" if t.get('accuracy') is not None else '--'
+    return (f"✅ AUTO-TRAIN 2H #{report['run_id']} HOÀN TẤT\n"
+            f"Board {t['boards']} · phiên mới {t['new_rounds']}\n"
+            f"Prediction {t['predictions']} · chốt {t['settled']}\n"
+            f"✅ {t['wins']} · ❌ {t['losses']} · {acc}\n"
+            "File JSON: API + lịch sử + đúng/sai + model cuối.")
+
+async def tg_send_document(client,chat_id,filename,content,caption=''):
+    if not BOT_TOKEN:return False
+    url=f'https://api.telegram.org/bot{BOT_TOKEN}/sendDocument'
+    r=await client.post(url,data={'chat_id':str(chat_id),'caption':caption[:900]},
+                        files={'document':(filename,content.encode('utf-8'),'application/json')},timeout=90)
+    r.raise_for_status();data=r.json()
+    return bool(data.get('ok'))
+
+async def timeout_monitor_loop():
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        while True:
+            try:
+                r=get_timeout_run(True)
+                if r:
+                    now=time.time()
+                    if r['status']=='active' and now>=r['ends_at']:
+                        with sqlite3.connect(DB_PATH) as db:
+                            db.execute("UPDATE timeout_runs SET status='report_pending' WHERE id=?",(r['id'],));db.commit()
+                        r=get_timeout_run(True)
+                    if r and r['status']=='report_pending':
+                        report=build_timeout_report(r)
+                        stamp=time.strftime('%Y%m%d_%H%M%S',time.localtime())
+                        filename=f"TAIXIUTOOL_AUTO_TRAIN_2H_{r['id']}_{stamp}.json"
+                        raw=json.dumps(report,ensure_ascii=False,indent=2)
+                        ok=await tg_send_document(client,r['admin_chat_id'],filename,raw,timeout_report_caption(report))
+                        if ok:
+                            with sqlite3.connect(DB_PATH) as db:
+                                db.execute("UPDATE timeout_runs SET status='finished',report_sent_at=?,last_error=NULL WHERE id=?",
+                                           (time.time(),r['id']));db.commit()
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:raise
+            except Exception as e:
+                try:
+                    r=get_timeout_run(True)
+                    if r:
+                        with sqlite3.connect(DB_PATH) as db:
+                            db.execute("UPDATE timeout_runs SET last_error=? WHERE id=?",(str(e)[:300],r['id']));db.commit()
+                except:pass
+                await asyncio.sleep(20)
+
+def mark_background_started(admin_id=None):
+    ensure_db()
+    now=time.time()
+    with sqlite3.connect(DB_PATH) as db:
+        row=db.execute('SELECT activated_at FROM background_service WHERE id=1').fetchone()
+        activated_at=row[0] if row and row[0] else now
+        db.execute('''INSERT INTO background_service(id,enabled,activated_at,activated_by,updated_at)
+                      VALUES(1,1,?,?,?)
+                      ON CONFLICT(id) DO UPDATE SET enabled=1,
+                        activated_by=COALESCE(background_service.activated_by,excluded.activated_by),
+                        updated_at=excluded.updated_at''',
+                   (activated_at,int(admin_id) if admin_id is not None else None,now))
+        db.commit()
+
+
+def background_status_payload():
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as db:
+        r=db.execute('SELECT enabled,activated_at,activated_by,updated_at FROM background_service WHERE id=1').fetchone()
+        round_count=db.execute('SELECT COUNT(*) FROM rounds').fetchone()[0]
+        pred_count=db.execute('SELECT COUNT(*) FROM shared_predictions').fetchone()[0]
+        settled=db.execute('SELECT COUNT(*) FROM shared_predictions WHERE actual IS NOT NULL').fetchone()[0]
+    now=time.time()
+    return {
+        'active':True,
+        'mode':'forever',
+        'enabled':bool(r[0]) if r else True,
+        'activated_at':r[1] if r else _process_started_at,
+        'activated_by':r[2] if r else None,
+        'process_started_at':_process_started_at,
+        'last_cycle':_last_cycle,
+        'last_cycle_age':max(0,round(now-_last_cycle,2)) if _last_cycle else None,
+        'rounds_saved':round_count,
+        'predictions_saved':pred_count,
+        'settled_saved':settled,
+        'history_limit_per_board':MAX_HISTORY,
+    }
+
+
+def background_status_text():
+    p=background_status_payload()
+    age=p.get('last_cycle_age')
+    age_txt=f"{age}s" if age is not None else 'đang khởi động'
+    return (f"♾ NỀN 24/7 · ĐANG CHẠY\n"
+            f"Worker: {age_txt} · lưu {p['rounds_saved']} phiên\n"
+            f"Prediction đã lưu: {p['predictions_saved']} · đã chốt {p['settled_saved']}\n"
+            "Tự poll ALL GAME, lưu lịch sử và cập nhật engine kể cả khi không mở web/Telegram.\n"
+            "Railway restart/redeploy xong worker tự chạy lại; SQLite /data giữ lịch sử.")
+
+
 def format_prediction(board,pred):
-    p=pred
-    if not p: return f'⏳ {board_label(board)} · chưa có dự đoán.'
-    model=p.get('model') or {}
-    text=(f"🎮 {board_label(board)}\n"
-          f"Phiên #{p.get('session','---')}\n"
-          f"Dự đoán: {display_pred(board,p.get('prediction'))} · {p.get('confidence',50)}%\n"
-          f"Engine: {model.get('engine','GPT-DEEP + AI-FUSION V25')}\n"
-          f"Mẫu: {model.get('pattern','---')} · {model.get('sample',0)} phiên")
+    if not pred:
+        return f'⏳ {board_label(board)} · chưa có dự đoán.'
+    model=pred.get('model') or {}
+    st=history_stats(board,20)
+    acc=f"{st['accuracy']}%" if st['accuracy'] is not None else '--'
+    text=(f"🎯 {board_label(board)} · #{pred.get('session','---')}\n"
+          f"{display_pred(board,pred.get('prediction'))} · tín hiệu {pred.get('confidence',50)}%\n"
+          f"📊 W20: ✅{st['wins']} ❌{st['losses']} · {acc}\n"
+          f"🧩 {model.get('pattern','---')} · học {model.get('sample',0)} phiên")
+
     df=model.get('dice_forecast') or {}
-    if board=='sunwin:sicbo' and df.get('ready'):
-        faces=[str(x.get('face','?')) for x in df.get('faces',[])[:3]]
-        text += f"\n🎲 Vị dự đoán: {' · '.join(faces)} · vùng tổng {df.get('sum_zone','---')}"
+    if board=='sunwin:sicbo':
+        if df.get('ready'):
+            faces=df.get('faces',[])[:3]
+            fv=' · '.join(str(x.get('face','?')) for x in faces)
+            vals=df.get('validation') or []
+            vv='/'.join(str(round(float(x)*100))+'%' for x in vals[:3]) if vals else '--'
+            text+=(f"\n🎲 Sicbo vị: {fv} · vùng tổng {df.get('sum_zone','---')}"
+                   f"\n↳ kiểm định vị: {vv} · chất lượng {round(float(df.get('quality',0))*100)}%")
+        else:
+            text+=f"\n🎲 Sicbo vị: đang học ({df.get('sample',0)}/18 phiên)"
+
     xf=model.get('xocdia_forecast') or {}
     if board=='lc79:xocdia' and xf:
-        text += f"\n⚪🔴 Thế phụ: {xf.get('label','---')}"
-    ml=model.get('ml') or {}
-    if ml.get('ready'):
-        text += f"\n🤖 Online ML: P(TÀI) {round(ml.get('p_tai',.5)*100)}% · val {round(ml.get('val_accuracy',.5)*100)}%"
-    return text
+        text+=f"\n🔴⚪ {xf.get('label','---')}"
+
+    # 3 prediction rows newest settled/pending for a compact audit trail.
+    recent=get_prediction_history(board,4)
+    if recent:
+        mini=[]
+        for x in recent:
+            if str(x.get('session'))==str(pred.get('session')) and x.get('actual') is None:
+                continue
+            mark='⏳' if x.get('actual') is None else ('✅' if x.get('ok') else '❌')
+            actual='…' if x.get('actual') is None else display_pred(board,x.get('actual'))
+            mini.append(f"{mark}#{x.get('session')} {display_pred(board,x.get('prediction'))}→{actual}")
+            if len(mini)>=3: break
+        if mini:
+            text+="\n📜 "+' | '.join(mini)
+    return text[:4000]
 
 
-def format_history(board,limit=12):
+def format_history(board,limit=15):
     h=get_prediction_history(board,limit)
-    if not h: return f'📜 {board_label(board)}\nChưa có lịch sử dự đoán chung.'
-    lines=[f'📜 {board_label(board)} · {min(limit,len(h))} dự đoán gần nhất']
+    if not h:
+        return f'📜 {board_label(board)} · chưa có lịch sử dự đoán.'
+    st=history_stats(board,max(20,limit))
+    acc=f"{st['accuracy']}%" if st['accuracy'] is not None else '--'
+    streak=f" · {'✅' if st['streak_ok'] else '❌'}x{st['streak']}" if st['streak'] else ''
+    lines=[f"📜 {board_label(board)} · ✅{st['wins']} ❌{st['losses']} · {acc}{streak}"]
     for x in h:
-        pred=display_pred(board,x['prediction'])
-        if x['actual'] is None: mark='⏳'; actual='chờ KQ'
+        pred=display_pred(board,x.get('prediction'))
+        if x.get('actual') is None:
+            mark='⏳';actual='chờ'
         else:
-            mark='✅' if x['ok'] else '❌'; actual=display_pred(board,x['actual'])
-        lines.append(f"{mark} #{x['session']} · {pred} → {actual} · {x['confidence']}%")
-    return '\n'.join(lines)
+            mark='✅' if x.get('ok') else '❌';actual=display_pred(board,x.get('actual'))
+        detail=''
+        d=x.get('dice') or []
+        if len(d)>=3:
+            detail=f" · {d[0]}-{d[1]}-{d[2]}={x.get('sum')}"
+        lines.append(f"{mark} #{x.get('session')} · {pred}→{actual} · {x.get('confidence')}%{detail}")
+    return '\n'.join(lines)[:4000]
+
 
 
 async def tg_call(client,method,payload=None):
@@ -1671,6 +2199,21 @@ async def bot_handle_message(client,msg):
         parts=text.split(maxsplit=1)
         uid=int(parts[1]) if len(parts)>1 and parts[1].lstrip('-').isdigit() else chat_id
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':permission_text(uid)}); return
+    if is_admin(chat_id) and text.startswith('/lock '):
+        try:
+            uid=int(text.split(maxsplit=1)[1]); grant_access(uid,chat_id,False)
+            out=f'⛔ USER {uid} đã bị TẮT toàn bộ quyền + AUTO.'
+        except: out='Cú pháp: /lock <user_id>'
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':out}); return
+    if is_admin(chat_id) and text.startswith('/unlock '):
+        parts=text.split()
+        try:
+            uid=int(parts[1]); preset=(parts[2].lower() if len(parts)>2 else 'basic')
+            if preset not in PRESETS: raise ValueError()
+            grant_access(uid,chat_id,True,preset)
+            out=f'✅ USER {uid} đã mở lại · {preset.upper()}\n'+permission_text(uid)
+        except: out='Cú pháp: /unlock <user_id> [basic|pro|vip]'
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':out}); return
     if is_admin(chat_id) and text.startswith('/revoke '):
         try: uid=int(text.split(maxsplit=1)[1]); grant_access(uid,chat_id,False); out=f'⛔ Đã khóa toàn bộ quyền của {uid}'
         except: out='Cú pháp: /revoke <user_id>'
@@ -1690,6 +2233,14 @@ async def bot_handle_message(client,msg):
         ) if rows else 'Chưa có user.'
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':('👥 USERS · P/H/G/A\n'+body)[:4000]}); return
 
+    if is_admin(chat_id) and text.startswith('/background'):
+        mark_background_started(chat_id)
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':background_status_text(),
+                                            'reply_markup':bot_admin_keyboard()}); return
+    if is_admin(chat_id) and text.startswith('/timeout'):
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,
+            'text':'♾ V29 đã bỏ chế độ 2 giờ. Nền 24/7 chạy liên tục.\n\n'+background_status_text(),
+            'reply_markup':bot_admin_keyboard()}); return
     if is_admin(chat_id) and text.startswith('/health'):
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':admin_health_text(),'reply_markup':bot_admin_keyboard()}); return
     if is_admin(chat_id) and text.startswith('/stats'):
@@ -1704,7 +2255,7 @@ async def bot_handle_message(client,msg):
         b=text.split(maxsplit=1)[1].strip()
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':await admin_test_api(client,b)}); return
     if is_admin(chat_id) and text.startswith('/apis'):
-        lines=['🔗 API V25']
+        lines=['🔗 API V29']
         for b,c in BOARDS.items():
             ec=effective_cfg(b,c); lines.append(f"{b}\n→ {ec.get('current','-')}"+(f"\nH {ec.get('history')}" if ec.get('history') else ''))
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'\n'.join(lines)[:4000],'reply_markup':bot_admin_keyboard()}); return
@@ -1731,9 +2282,14 @@ async def bot_handle_message(client,msg):
     if text.startswith('/start') or text.startswith('/games') or text.startswith('/menu'):
         if not has_access(chat_id):
             await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':f'🔒 Chưa được cấp quyền.\nUser ID: {chat_id}\nAdmin dùng /grant {chat_id} để mở BASIC.'}); return
+        bg_note=''
+        if text.startswith('/start') and is_admin(chat_id):
+            mark_background_started(chat_id)
+            bg_note='\n\n♾ Nền 24/7 đang chạy vĩnh viễn trên Railway; không cần /start lại.'
         await tg_call(client,'sendMessage',{'chat_id':chat_id,
-            'text':'🎛 TAIXIUTOOL V25 · GAME → BÀN → TÍNH NĂNG\nNút khóa = chưa được cấp quyền.',
+            'text':'🎛 TAIXIUTOOL V29 · GAME → BÀN → TÍNH NĂNG\nNút khóa = chưa được cấp quyền.'+bg_note,
             'reply_markup':bot_games_keyboard(chat_id)}); return
+
 
     if not has_access(chat_id):
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':f'🔒 Chưa được cấp quyền. User ID: {chat_id}'}); return
@@ -1745,6 +2301,18 @@ async def bot_handle_message(client,msg):
         await tg_call(client,'sendMessage',{'chat_id':chat_id,
             'text':format_prediction(board,get_shared_prediction(board)) if board else 'Chưa chọn bàn. Dùng /games.',
             'reply_markup':bot_board_keyboard(board,chat_id) if board else bot_games_keyboard(chat_id)}); return
+    if text.startswith('/historyall'):
+        if not feature_allowed(chat_id,'history'):
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':locked_text(chat_id,'history')}); return
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':format_all_history(),
+                                            'reply_markup':bot_games_keyboard(chat_id)}); return
+    if text.startswith('/results'):
+        if not feature_allowed(chat_id,'history'):
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':locked_text(chat_id,'history')}); return
+        if not board:
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'Chưa chọn bàn. Dùng /games.'}); return
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':format_round_history(board,15),
+                                            'reply_markup':bot_board_keyboard(board,chat_id)}); return
     if text.startswith('/history'):
         if not feature_allowed(chat_id,'history'):
             await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':locked_text(chat_id,'history')}); return
@@ -1782,6 +2350,7 @@ async def bot_handle_callback(client,q):
         act=data.split('|',1)[1]
         if act=='health': txt=admin_health_text()
         elif act=='stats': txt=admin_stats_text()
+        elif act=='background': txt=background_status_text() 
         elif act=='apis': txt='🔗 Dùng /apis để xem URL hoặc /testapi <board>.'
         elif act=='engine':
             b=get_selected_board(chat_id); txt=engine_diag_text(b) if b else 'Chọn bàn trước hoặc dùng /engine <board>.'
@@ -1789,7 +2358,8 @@ async def bot_handle_callback(client,q):
             b=get_selected_board(chat_id); txt=deep_local_text(b) if b else 'Chọn bàn trước hoặc dùng /deep <board>.'
         else:
             txt=('🔐 QUYỀN NHANH\n/grant ID = BASIC\n/grantpro ID = PRO\n/grantvip ID = VIP\n'
-                 '/permit ID ai|history|auto|predict\n/deny ID <feature>\n/perms ID\n/revoke ID')
+                 '/permit ID ai|history|auto|predict\n/deny ID <feature>\n'
+                 '/lock ID · /unlock ID basic|pro|vip\n/perms ID')
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':txt,'reply_markup':bot_admin_keyboard()}); return
 
     if data=='perm':
@@ -1810,6 +2380,12 @@ async def bot_handle_callback(client,q):
             await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'Game chưa có bàn dữ liệu.'}); return
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':GAME_TITLES.get(game,game)+' · chọn bàn:',
                                             'reply_markup':bot_game_keyboard(game,chat_id)}); return
+
+    if data=='histall':
+        if not feature_allowed(chat_id,'history'):
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':locked_text(chat_id,'history')}); return
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':format_all_history(),
+                                            'reply_markup':bot_games_keyboard(chat_id)}); return
 
     if data in ('allon','alloff'):
         if not feature_allowed(chat_id,'auto'):
@@ -1834,7 +2410,7 @@ async def bot_handle_callback(client,q):
             'reply_markup':bot_board_keyboard(board,chat_id)}); return
 
     set_selected_board(chat_id,board)
-    feat={'now':'predict','hist':'history','ai':'ai','auto':'auto','on':'auto','off':'auto'}.get(action)
+    feat={'now':'predict','hist':'history','rounds':'history','ai':'ai','auto':'auto','on':'auto','off':'auto'}.get(action)
     if feat and not feature_allowed(chat_id,feat):
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':locked_text(chat_id,feat),
                                             'reply_markup':bot_board_keyboard(board,chat_id)}); return
@@ -1852,6 +2428,8 @@ async def bot_handle_callback(client,q):
         txt=await ai_explain_board(client,board)
     elif action=='hist':
         txt=format_history(board)
+    elif action=='rounds':
+        txt=format_round_history(board,15)
     else:
         return
     await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':txt,'reply_markup':bot_board_keyboard(board,chat_id)})
@@ -1877,6 +2455,7 @@ async def telegram_loop():
 async def lifespan(app: FastAPI):
     global _worker_task, _bot_task
     ensure_db()
+    mark_background_started(None)
     _worker_task=asyncio.create_task(worker_loop())
     if BOT_TOKEN:
         _bot_task=asyncio.create_task(telegram_loop())
@@ -1887,12 +2466,12 @@ async def lifespan(app: FastAPI):
             try: await task
             except BaseException: pass
 
-app=FastAPI(title='TAIXIUTOOL V25 Compact Control API', lifespan=lifespan)
+app=FastAPI(title='TAIXIUTOOL V29 Forever Background API', lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_credentials=False,allow_methods=['GET'],allow_headers=['*'])
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'admin_count':len(ADMIN_IDS),'max_history':MAX_HISTORY,'chatgpt_enabled':bool(OPENAI_API_KEY and OPENAI_MODEL),'engine':'GPT-DEEP + AI-FUSION V25'}
+    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'admin_count':len(ADMIN_IDS),'max_history':MAX_HISTORY,'chatgpt_enabled':bool(OPENAI_API_KEY and OPENAI_MODEL),'engine':'GPT-DEEP + AI-FUSION V29','background':background_status_payload(),'sync_version':'V29_SERVER_ONLY'}
 
 @app.get('/api/learn/{game}/{table}')
 def learn(game:str, table:str, limit:int=Query(1000,ge=20,le=1000), sub:str|None=None):
@@ -1920,6 +2499,47 @@ def learn(game:str, table:str, limit:int=Query(1000,ge=20,le=1000), sub:str|None
             state={'updated_at':row[0],'source_ok':bool(row[1]),'last_error':row[2], 'model':json.loads(row[3]) if row[3] else None}
     return {'game':game,'table':table,'rows':rows,'model':model_snapshot(rows,game,board),'state':state,
             'shared_prediction':get_shared_prediction(board),'prediction_history':get_prediction_history(board,20)}
+
+@app.get('/api/background/status')
+def api_background_status():
+    return background_status_payload()
+
+@app.get('/api/timeout/status')
+def api_timeout_status_legacy():
+    return {'deprecated':True,'message':'V29 dùng nền 24/7','background':background_status_payload()}
+
+@app.get('/api/sync/all')
+def api_sync_all(limit:int=Query(80,ge=20,le=240)):
+    boards={}
+    for board in available_bot_boards():
+        rows=load_rows(board,limit)
+        with sqlite3.connect(DB_PATH) as db:
+            st=db.execute('SELECT updated_at,source_ok,last_error,model_json FROM board_state WHERE board=?',(board,)).fetchone()
+        state=None;model=None
+        if st:
+            try:model=json.loads(st[3]) if st[3] else None
+            except:model=None
+            state={'updated_at':st[0],'source_ok':bool(st[1]),'last_error':st[2]}
+        boards[board]={'rows':rows,'model':model,'state':state,
+                       'shared_prediction':get_shared_prediction(board),
+                       'prediction_history':get_prediction_history(board,20)}
+    return {'ok':True,'server_time':time.time(),'engine':'GPT-DEEP + AI-FUSION V29',
+            'poll_seconds':POLL_SECONDS,'source_of_truth':'railway',
+            'sync_id':int(_last_cycle*1000) if _last_cycle else 0,
+            'boards':boards,'background':background_status_payload()}
+
+@app.get('/api/history/all')
+def api_history_all():
+    data={}
+    for b in available_bot_boards():
+        data[b]={
+            'label':board_label(b),
+            'stats':history_stats(b,100),
+            'prediction_history':get_prediction_history(b,20),
+            'rounds':load_rows(b,20)
+        }
+    return {'ok':True,'source':'background-24x7','background':background_status_payload(),'boards':data}
+
 
 @app.get('/api/predict/{game}/{table}')
 def predict_api(game:str,table:str,sub:str|None=None):
