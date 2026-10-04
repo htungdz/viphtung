@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -29,8 +29,9 @@ BOARDS = {
         'history':'https://kwinstore.com/sunwin/tx/history/9b7a587deb56a4caf8de8ffdb0c13e8d22e793ae598b66c7',
     },
     'sunwin:sicbo': {
-        'game':'sunwin','table':'sicbo','kind':'sicbo',
-        'current':'https://ent-glenn-terrain-project.trycloudflare.com/sicbo/sunwin',
+        'game':'sunwin','table':'sicbo','kind':'sicbo_pair',
+        'current':'https://kwinstore.com/sunwin/sicbo/9b7a587deb56a4caf8de8ffdb0c13e8d22e793ae598b66c7',
+        'history':'https://kwinstore.com/sunwin/sicbo/history/9b7a587deb56a4caf8de8ffdb0c13e8d22e793ae598b66c7',
     },
     'lc79:hu': {
         'game':'lc79','table':'hu','kind':'tx_pair',
@@ -170,6 +171,13 @@ def ensure_db():
         cols={r[1] for r in db.execute('PRAGMA table_info(rounds)').fetchall()}
         if 'meta_json' not in cols:
             db.execute('ALTER TABLE rounds ADD COLUMN meta_json TEXT')
+        access_cols={r[1] for r in db.execute('PRAGMA table_info(bot_access)').fetchall()}
+        if 'expires_at' not in access_cols:
+            db.execute('ALTER TABLE bot_access ADD COLUMN expires_at REAL')
+        if 'access_label' not in access_cols:
+            db.execute("ALTER TABLE bot_access ADD COLUMN access_label TEXT DEFAULT 'manual'")
+        if 'purchased_at' not in access_cols:
+            db.execute('ALTER TABLE bot_access ADD COLUMN purchased_at REAL')
         db.commit()
 
 
@@ -308,15 +316,119 @@ def parse_sicbo(data):
             'result':r,
             'dice':d,
             'sum':t,
-            'md5':pick(o,['md5','hash','md5_result']),
+            'md5':pick(o,['md5_enc','md5','hash','md5_hash','md5Hash','md5_result','md5_dec','raw_rS','raw_rs']),
             'meta':{
                 'source_game':pick(o,['game','name']) or 'sunwin',
-                'update_at':pick(o,['update_at','updated_at','last_update']),
+                'update_at':pick(o,['update_at','updated_at','last_update','last_update_at','tick_update_at']),
+                'md5_dec':pick(o,['md5_dec']),
+                'raw_rs':pick(o,['raw_rS','raw_rs']),
+                'jackpot':pick(o,['jackpot']),
                 'raw_session':str(raw_sid) if raw_sid is not None else None
             }
         })
     out.sort(key=lambda x:(_session_num(x['id']) is None,_session_num(x['id']) or 0))
     return out
+
+
+def sicbo_hash_features(h):
+    """Adapted deterministic feature analyzer from sicbo(1).txt.
+    The score is a heuristic signal, not a real probability.
+    """
+    if not h:return None
+    h=str(h).strip().lower()
+    m=re.search(r'([0-9a-f]{32,64})',h)
+    if not m:return None
+    h=m.group(1)
+    try:
+        p=[int(h[i:i+2],16) for i in range(0,min(len(h),64),2) if i+2<=len(h)]
+        if not p:return None
+        dS=sum(int(c,16) for c in h[:32]);hS=sum(p)
+        bO=bin(int(h[:32],16))[2:].count('1')
+        try:b1=int(h[:32],16).bit_count()/(len(h[:32])*4)
+        except:b1=0.0
+        h8=sum(1 for c in h[:32] if int(c,16)>=8)/max(1,len(h[:32]))
+        xV=0
+        for v in p[:16]:xV^=v
+        lu=[2,1]
+        for _ in range(2,15):lu.append(lu[-1]+lu[-2])
+        lw=sum(p[i]*lu[i] for i in range(min(len(p),15)))
+        mean=sum(p)/len(p)
+        std=math.sqrt(sum((x-mean)**2 for x in p)/len(p))
+        comp=len(set(h[:32]))
+        fo=sum(abs(p[i]-p[i-1]) for i in range(1,min(len(p),16)))
+        sha=''.join(hex(((ord(h[i%len(h)])*(i+1)+7)%16))[2:] for i in range(56))
+        sP=[int(sha[i:i+2],16) for i in range(0,len(sha)-1,2)]
+        sS=sum(sP) if sP else 0
+        hl=len(h)//2
+        sym=sum(1 for i in range(min(hl,16)) if i<len(h) and hl+i<len(h) and h[i]==h[hl+i])
+        first=p[:10]
+        geo=math.pow(math.prod(first),1/len(first)) if len(first)>=10 and all(v>0 for v in first) else 0.0
+        cX=xV^(int(sha[:2],16) if sha[:2] else 0)
+        def fib_mod(x,mod):
+            a,b=0,1
+            for _ in range(2,x+1):a,b=b,a+b
+            return b%mod
+        fib=fib_mod(dS,100) if dS>0 else 0
+        bX=0
+        for i in range(0,len(sha)-1,2):bX^=int(sha[i:i+2],16)
+        wE=(p[0]*3+p[-1]*2)%100 if p else 50
+        mV=[hS%x for x in (43,47,53,59,61,67)] if hS else [0]*6
+        maxR=max((h[:32].count(c) for c in set(h[:32])),default=0)
+        odd=sum(1 for c in h[:32] if int(c,16)%2==1)
+        sI=len(p)//4;eI=(3*len(p))//4
+        mid=sum(p[sI:eI]) if sI<eI else 0
+        fibH=sum(1 for c in h[:32] if c in '12358')
+        shaSym=sum(1 for i in range(16) if i<len(sha) and 39-i<len(sha) and sha[i]==sha[39-i])
+        freq={}
+        for c in h[:32]:freq[c]=freq.get(c,0)+1
+        ent=0.0
+        for v in freq.values():
+            pc=v/max(1,len(h[:32]))
+            if pc>0:ent-=pc*math.log2(pc)
+        tX=xV^bX^cX;last=int(h[-1],16);wf=1.0 if len(h)>=32 else .8
+        score=(dS*.05+hS*.05+bO*.05+b1*.1+h8*.1+lw*.05+std*.05+comp*.05+fo*.05+
+               sS*.05+sym*.05+geo*.05+cX*.05+fib*.05+bX*.05+wE*.05+sum(mV)*.05+
+               maxR*.05+odd*.05+mid*.05+fibH*.05+shaSym*.05+ent*.05+tX*.05+last*.05)*wf%100
+        return {'raw_score':round(score,4),'raw_prediction':'TÀI' if score>=50 else 'XỈU',
+                'tai_signal':round(score,2),'xiu_signal':round(100-score,2),
+                'entropy':round(ent,4),'bit_density':round(b1,4),'byte_std':round(std,3),'hex_unique':comp}
+    except Exception:
+        return None
+
+def sicbo_hash_signal(rows):
+    """Calibrate hash direction causally on this board's own history."""
+    hist=[r for r in rows[-260:] if r.get('result') in ('TÀI','XỈU')]
+    if not hist:return {'ready':False,'usable':False,'sample':0}
+    tests=[]
+    for i in range(1,len(hist)):
+        f=sicbo_hash_features(hist[i-1].get('md5'))
+        if f:tests.append((f['raw_prediction'],hist[i]['result']))
+    n=len(tests);raw_w=sum(1 for p,a in tests if p==a);inv_w=sum(1 for p,a in tests if _opp(p)==a)
+    orientation='normal' if raw_w>=inv_w else 'reverse'
+    best_w=max(raw_w,inv_w)
+    quality=(best_w+8*.5)/max(1,n+8)
+    raw_acc=raw_w/max(1,n)
+    latest=sicbo_hash_features(hist[-1].get('md5'))
+    if not latest:
+        return {'ready':False,'usable':False,'sample':n,'orientation':orientation,
+                'quality':round(quality,4),'raw_accuracy':round(raw_acc,4)}
+    pred=latest['raw_prediction'] if orientation=='normal' else _opp(latest['raw_prediction'])
+    usable=(n>=18 and quality>=.525)
+    return {'ready':True,'usable':usable,'sample':n,'orientation':orientation,
+            'prediction':pred,'quality':round(quality,4),'raw_accuracy':round(raw_acc,4),
+            'raw_prediction':latest['raw_prediction'],'raw_score':latest['raw_score'],
+            'tai_signal':latest['tai_signal'],'xiu_signal':latest['xiu_signal'],
+            'note':'calibrated historical hash signal'}
+
+def sicbo_dice_side(rows):
+    df=dice_position_forecast(rows)
+    if not df.get('ready'):
+        return {'ready':False,'prediction':None,'quality':0.0,'forecast':df}
+    expected=float(df.get('expected_total') or 10.5)
+    pred='TÀI' if expected>=10.5 else 'XỈU'
+    q=float(df.get('quality') or 0.0)
+    meta_q=_clamp(.48+max(0.0,q-.18)*.20,.48,.61)
+    return {'ready':True,'prediction':pred,'quality':round(meta_q,4),'forecast':df}
 
 
 def parse_xocdia(data):
@@ -674,7 +786,7 @@ def model_snapshot(rows, game=None, board=None):
     if len(seq)<6:
         return {'sample':len(seq),'score':0.0,'prediction':None,'confidence':50,'percent':50,
                 'pattern':'ĐANG HỌC','alt':'Chưa đủ mẫu','entropy':round(_entropy(seq),4),
-                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'CHAMPION 15 STRATEGY + FUSION V33',
+                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'BOARD-META 18 + SICBO HASH META V37',
                 'skills':0,'totalSkills':60,'ml':{'ready':False},'updated_at':time.time()}
     vote=lambda x: 1 if x=='TÀI' else -1
     n=len(seq); comps=[]
@@ -920,7 +1032,7 @@ def model_snapshot(rows, game=None, board=None):
     return {'sample':n,'score':round(score,4),'prediction':pred,'confidence':conf,'percent':conf,
             'run':run,'pattern':pattern,'alt':alt,'entropy':round(H,4),
             'cycle':{'k':lag,'r':round(best,4)},'agreement':round(agreement,4),
-            'engine':'CHAMPION 15 STRATEGY + FUSION V33','skills':len(active),'totalSkills':60,
+            'engine':'BOARD-META 18 + SICBO HASH META V37','skills':len(active),'totalSkills':60,
             'ml':ml,'top_signals':top_signals,'updated_at':time.time()}
 
 # V32: V31 fusion becomes one candidate strategy instead of the only final decider.
@@ -930,8 +1042,48 @@ STRATEGY_NAMES = (
     'FOLLOW_LAST','REVERSE_LAST','ALTERNATING_PATTERN','RUN_BREAK','RUN_FOLLOW',
     'BIAS_MEAN_REVERSION','BIAS_MOMENTUM','MARKOV_TRANSITION','ANTI_RAW',
     'HIGH_ORDER_MARKOV','MARKOV_ORDER2','RUN_HAZARD','MULTI_WINDOW',
+    'DECAYED_TRANSITION','REGIME_ADAPTIVE','MOTIF_WEIGHTED',
     'SUFFIX_CONTEXT','FUSION_CORE'
 )
+
+
+# V34: mỗi board tự đánh giá strategy trên lịch sử của chính board đó.
+# HITCLUB giữ CHAMPION vì người dùng báo đang chạy ổn; các board còn lại dùng
+# walk-forward + consensus thay vì bê nguyên champion của HITCLUB sang.
+BOARD_META_PROFILES = {
+    'hitclub:hu':   {'mode':'champion','top_k':1,'wf_depth':160,'reverse_min':28,'reverse_gap':.16},
+    'hitclub:md5':  {'mode':'champion','top_k':1,'wf_depth':160,'reverse_min':28,'reverse_gap':.16},
+    'sunwin:hu':    {'mode':'consensus','top_k':4,'wf_depth':220,'reverse_min':34,'reverse_gap':.18,
+                     'prefer':('MARKOV_ORDER2','SUFFIX_CONTEXT','MULTI_WINDOW','HIGH_ORDER_MARKOV','FUSION_CORE')},
+    'sunwin:sicbo': {'mode':'consensus','top_k':5,'wf_depth':240,'reverse_min':40,'reverse_gap':.22,
+                     'prefer':('REGIME_ADAPTIVE','DECAYED_TRANSITION','MOTIF_WEIGHTED',
+                               'MARKOV_ORDER2','RUN_HAZARD','SUFFIX_CONTEXT','FUSION_CORE')},
+    'lc79:hu':      {'mode':'consensus','top_k':4,'wf_depth':220,'reverse_min':34,'reverse_gap':.18,
+                     'prefer':('MARKOV_ORDER2','SUFFIX_CONTEXT','RUN_HAZARD','MULTI_WINDOW','FUSION_CORE')},
+    'lc79:md5':     {'mode':'consensus','top_k':4,'wf_depth':240,'reverse_min':34,'reverse_gap':.18,
+                     'prefer':('SUFFIX_CONTEXT','HIGH_ORDER_MARKOV','MARKOV_ORDER2','MULTI_WINDOW','FUSION_CORE')},
+    'lc79:xocdia':  {'mode':'consensus','top_k':3,'wf_depth':200,'reverse_min':36,'reverse_gap':.20,
+                     'prefer':('MARKOV_ORDER2','RUN_HAZARD','SUFFIX_CONTEXT','MULTI_WINDOW')},
+    'gb68:hu':      {'mode':'consensus','top_k':3,'wf_depth':180,'reverse_min':32,'reverse_gap':.19},
+    'gb68:md5':     {'mode':'consensus','top_k':4,'wf_depth':220,'reverse_min':34,'reverse_gap':.18,
+                     'prefer':('SUFFIX_CONTEXT','MARKOV_ORDER2','HIGH_ORDER_MARKOV','FUSION_CORE')},
+    'betvip:hu':    {'mode':'consensus','top_k':3,'wf_depth':160,'reverse_min':32,'reverse_gap':.20},
+    'betvip:md5':   {'mode':'consensus','top_k':3,'wf_depth':160,'reverse_min':32,'reverse_gap':.20},
+    'b52:hu':       {'mode':'consensus','top_k':3,'wf_depth':160,'reverse_min':32,'reverse_gap':.20},
+    'b52:md5':      {'mode':'consensus','top_k':3,'wf_depth':160,'reverse_min':32,'reverse_gap':.20},
+    'max789:hu':    {'mode':'consensus','top_k':3,'wf_depth':160,'reverse_min':32,'reverse_gap':.20},
+    'max789:md5':   {'mode':'consensus','top_k':3,'wf_depth':160,'reverse_min':32,'reverse_gap':.20},
+    'son789:hu':    {'mode':'consensus','top_k':3,'wf_depth':160,'reverse_min':32,'reverse_gap':.20},
+    'son789:md5':   {'mode':'consensus','top_k':3,'wf_depth':160,'reverse_min':32,'reverse_gap':.20},
+}
+_WF_CACHE={}
+
+def _profile_for(board):
+    if board in BOARD_META_PROFILES:return BOARD_META_PROFILES[board]
+    if str(board).startswith('baccarat:'):
+        return {'mode':'consensus','top_k':3,'wf_depth':180,'reverse_min':34,'reverse_gap':.19,
+                'prefer':('MARKOV_ORDER2','SUFFIX_CONTEXT','RUN_HAZARD','FUSION_CORE')}
+    return {'mode':'consensus','top_k':3,'wf_depth':170,'reverse_min':34,'reverse_gap':.20}
 
 def _opp(side):
     return 'XỈU' if side=='TÀI' else 'TÀI'
@@ -1025,6 +1177,129 @@ def _multi_window_prediction(seq):
     if abs(vote)<.1: return _markov_prediction(seq,2)
     return 'TÀI' if vote>0 else 'XỈU'
 
+
+def _decayed_transition_prediction(seq,order=2,decay=.955):
+    if not seq:return 'TÀI'
+    order=max(1,min(4,int(order)))
+    if len(seq)<=order+3:return _markov_prediction(seq,order)
+    ctx=tuple(seq[-order:]);t=x=.7
+    for i in range(order,len(seq)):
+        if tuple(seq[i-order:i])!=ctx:continue
+        age=(len(seq)-1)-i;w=decay**age
+        if seq[i]=='TÀI':t+=w
+        else:x+=w
+    return 'TÀI' if t>=x else 'XỈU'
+
+def _motif_weighted_prediction(seq):
+    if not seq:return 'TÀI'
+    vt=vx=0.0
+    for L in (2,3,4,5,6):
+        if len(seq)<=L+1:continue
+        motif=tuple(seq[-L:])
+        for i in range(L,len(seq)):
+            if tuple(seq[i-L:i])!=motif:continue
+            age=(len(seq)-1)-i;w=(1.0+.20*L)*(.965**age)
+            if seq[i]=='TÀI':vt+=w
+            else:vx+=w
+    if vt+vx<1.2:return _markov_prediction(seq,2)
+    return 'TÀI' if vt>=vx else 'XỈU'
+
+def _regime_adaptive_prediction(seq):
+    if not seq:return 'TÀI'
+    q=seq[-24:];last=q[-1];run=_run_len(q)
+    flips=sum(1 for i in range(1,len(q)) if q[i]!=q[i-1])/max(1,len(q)-1);p=q.count('TÀI')/len(q)
+    if flips>=.70:return _opp(last)
+    if run>=3:return _run_hazard_prediction(seq)
+    if p>=.70:return 'XỈU'
+    if p<=.30:return 'TÀI'
+    if p>=.57:return 'TÀI'
+    if p<=.43:return 'XỈU'
+    return _decayed_transition_prediction(seq,2)
+
+def _pure_strategy_predictions(seq):
+    """Causal predictors dùng riêng để walk-forward, không đọc future/DB feedback."""
+    if not seq:return {}
+    last=seq[-1];run=_run_len(seq);q6=seq[-6:]
+    flips=sum(1 for i in range(1,len(q6)) if q6[i]!=q6[i-1]);alt=flips/max(1,len(q6)-1)
+    p20=seq[-20:].count('TÀI')/max(1,len(seq[-20:]));p12=seq[-12:].count('TÀI')/max(1,len(seq[-12:]))
+    return {
+      'FOLLOW_LAST':last,'REVERSE_LAST':_opp(last),
+      'ALTERNATING_PATTERN':_opp(last) if alt>=.60 else _markov_prediction(seq,1),
+      'RUN_BREAK':_opp(last) if run>=3 else _markov_prediction(seq,1),
+      'RUN_FOLLOW':last if 2<=run<=3 else (_opp(last) if run>=5 else _markov_prediction(seq,1)),
+      'BIAS_MEAN_REVERSION':'XỈU' if p20>=.60 else 'TÀI' if p20<=.40 else _opp(last),
+      'BIAS_MOMENTUM':'TÀI' if p12>=.58 else 'XỈU' if p12<=.42 else last,
+      'MARKOV_TRANSITION':_markov_prediction(seq,1),'HIGH_ORDER_MARKOV':_markov_prediction(seq,3),
+      'MARKOV_ORDER2':_markov_prediction(seq,2),'RUN_HAZARD':_run_hazard_prediction(seq),
+      'MULTI_WINDOW':_multi_window_prediction(seq),
+      'DECAYED_TRANSITION':_decayed_transition_prediction(seq,2),
+      'REGIME_ADAPTIVE':_regime_adaptive_prediction(seq),'MOTIF_WEIGHTED':_motif_weighted_prediction(seq),
+      'SUFFIX_CONTEXT':_suffix_prediction(seq)
+    }
+
+def _bayes_rate(wins,total,prior_n=14,prior_p=.5):
+    return (wins+prior_n*prior_p)/max(1,total+prior_n)
+
+def walk_forward_strategy_stats(board,rows):
+    profile=_profile_for(board); seq=_seq(rows); last_id=str(rows[-1].get('id')) if rows else ''
+    key=(board,last_id,len(seq),profile.get('wf_depth',170))
+    if key in _WF_CACHE:return _WF_CACHE[key]
+    depth=int(profile.get('wf_depth',170));seq=seq[-max(depth+40,70):]
+    names=[n for n in STRATEGY_NAMES if n not in ('ANTI_RAW','FUSION_CORE')]
+    rec={n:[] for n in names};start=max(18,len(seq)-depth)
+    for i in range(start,len(seq)):
+        hist=seq[:i];actual=seq[i];preds=_pure_strategy_predictions(hist)
+        for n in names:
+            p=preds.get(n)
+            if p in ('TÀI','XỈU'):rec[n].append(p==actual)
+    out={}
+    for n,vals in rec.items():
+        def st(q):
+            total=len(q);wins=sum(1 for x in q if x)
+            return {'total':total,'win':wins,'loss':total-wins,
+                    'win_rate':_bayes_rate(wins,total),'raw_win_rate':wins/total if total else .5}
+        s20=st(vals[-20:]);s50=st(vals[-50:]);s100=st(vals[-100:])
+        score=.54*s20['win_rate']+.31*s50['win_rate']+.15*s100['win_rate']
+        if s20['total']<14:score-=.025
+        if s50['total']<32:score-=.020
+        out[n]={'short':s20,'mid':s50,'long':s100,'score':round(score,5),'samples':len(vals)}
+    _WF_CACHE.clear();_WF_CACHE[key]=out
+    return out
+
+def _combined_quality(board,name,live,wf):
+    ls=live.get(name,{});ws=wf.get(name,{})
+    l20=ls.get('short',{});l50=ls.get('mid',{});w20=ws.get('short',{});w50=ws.get('mid',{})
+    ln=int(l20.get('total',0));wn=int(w20.get('total',0))
+    lw=min(.62,ln/38*.62);ww=1-lw
+    lr=.62*float(l20.get('win_rate',.5))+.38*float(l50.get('win_rate',.5))
+    wr=.64*float(w20.get('win_rate',.5))+.36*float(w50.get('win_rate',.5))
+    q=lw*lr+ww*wr
+    if name in _profile_for(board).get('prefer',()):q+=.012
+    if wn<18:q-=.020
+    if int(l20.get('loss_streak',0))>=3:q-=.045
+    # Strategies worse than chance on both recent windows should not lead.
+    if wn>=18 and float(w20.get('raw_win_rate',.5))<.44:q-=.035
+    return _clamp(q,.34,.69)
+
+def _meta_consensus(board,preds,live,wf):
+    prof=_profile_for(board);c=[]
+    for n,p in preds.items():
+        if p.get('prediction') not in ('TÀI','XỈU'):continue
+        q=_combined_quality(board,n,live,wf)
+        if n=='ANTI_RAW' and live.get(n,{}).get('short',{}).get('total',0)<14:continue
+        c.append({'name':n,'prediction':p['prediction'],'quality':q,'edge':q-.5})
+    c.sort(key=lambda x:x['quality'],reverse=True);top=c[:max(1,int(prof.get('top_k',3)))]
+    vt=vx=0.0
+    for x in top:
+        w=max(.015,x['edge']+.02)
+        if x['prediction']=='TÀI':vt+=w
+        else:vx+=w
+    if abs(vt-vx)<.015:
+        final=top[0]['prediction'] if top else 'TÀI'
+    else:final='TÀI' if vt>vx else 'XỈU'
+    total=max(.001,vt+vx);agree=max(vt,vx)/total
+    return final,top,agree
+
 def _strategy_predictors(board,rows,fusion):
     seq=_seq(rows)
     if not seq: seq=['TÀI']
@@ -1055,6 +1330,9 @@ def _strategy_predictors(board,rows,fusion):
     put('MARKOV_ORDER2',_markov_prediction(seq,2),53,'Markov ngữ cảnh bậc 2')
     put('RUN_HAZARD',_run_hazard_prediction(seq),52,'Xác suất tiếp/bẻ theo độ dài bệt')
     put('MULTI_WINDOW',_multi_window_prediction(seq),52,'Bỏ phiếu W8/W16/W32/W64')
+    put('DECAYED_TRANSITION',_decayed_transition_prediction(seq,2),54,'Transition có trọng số recency')
+    put('REGIME_ADAPTIVE',_regime_adaptive_prediction(seq),54,'Tự đổi logic theo alternating/run/bias regime')
+    put('MOTIF_WEIGHTED',_motif_weighted_prediction(seq),53,'Motif 2–6 có trọng số độ dài + độ mới')
     put('SUFFIX_CONTEXT',_suffix_prediction(seq),52,'Suffix/motif context 2–6')
     put('FUSION_CORE',fusion_pred,int(fusion.get('confidence',50)),'V31 fusion core độc lập')
     return preds
@@ -1160,43 +1438,86 @@ def _status_from_conf(model_conf,st):
 
 def model_snapshot(rows, game=None, board=None):
     fusion=fusion_model_snapshot(rows,game,board)
-    if not board: return fusion
+    if not board:return fusion
     seq=_seq(rows)
     if len(seq)<2:
-        fusion['engine']='CHAMPION 15 STRATEGY + FUSION V33'
-        return fusion
+        fusion['engine']='BOARD-META 18 + SICBO HASH META V37';return fusion
     preds=_strategy_predictors(board,rows,fusion)
-    champion,stats=select_champion(board,preds)
-    recent=_final_performance(board)
-    recovery=((recent['n50']>=50 and recent['wr50']<.45) or
-              (recent['n20']>=20 and recent['wr20']<.40) or
-              recent['loss_streak']>=5)
-    reverse_mode=((recent['n20']>=20 and recent['wr20']<.45) or
-                  (recent['n20']>=20 and recent['reverse_win_rate']-recent['normal_win_rate']>=.15))
-    raw=preds[champion]['prediction']; final=_opp(raw) if reverse_mode else raw
-    st=stats.get(champion,{})
-    model_conf,display=_champion_confidence(st,recovery,recent)
+    live=get_strategy_stats_map(board);wf=walk_forward_strategy_stats(board,rows);prof=_profile_for(board)
+    champion,_=select_champion(board,preds);recent=_final_performance(board)
+    if prof.get('mode')=='champion':
+        raw=preds[champion]['prediction'];decision=champion;decision_mode='CHAMPION'
+        top=[{'name':champion,'prediction':raw,'quality':_combined_quality(board,champion,live,wf)}];agree=1.0
+    else:
+        raw,top,agree=_meta_consensus(board,preds,live,wf);decision='META['+', '.join(x['name'] for x in top[:3])+']';decision_mode='BOARD_META'
+
+    sicbo_hash=None;sicbo_dice=None
+    if board=='sunwin:sicbo':
+        sicbo_hash=sicbo_hash_signal(rows)
+        sicbo_dice=sicbo_dice_side(rows)
+        if sicbo_hash.get('usable'):
+            hpred=sicbo_hash.get('prediction');hq=float(sicbo_hash.get('quality',.5))
+            top.append({'name':'SICBO_HASH_CAL','prediction':hpred,'quality':hq})
+            if hpred==raw:
+                agree=_clamp(agree+min(.07,max(0,hq-.5)*.8),.5,.95)
+            elif agree<.585 and hq>=.545:
+                raw=hpred;decision='SICBO_HASH_TIEBREAK';decision_mode='SICBO_META';agree=max(.56,hq)
+            else:
+                agree=max(.50,agree-.025)
+        if sicbo_dice.get('ready'):
+            dpred=sicbo_dice.get('prediction');dq=float(sicbo_dice.get('quality',.5))
+            top.append({'name':'SICBO_DICE_META','prediction':dpred,'quality':dq})
+            if dpred==raw:
+                agree=_clamp(agree+min(.05,max(0,dq-.5)*.7),.5,.95)
+            elif agree<.555 and dq>=.535:
+                raw=dpred;decision='SICBO_DICE_TIEBREAK';decision_mode='SICBO_META';agree=max(.54,dq)
+
+    rmin=int(prof.get('reverse_min',34));gap=float(prof.get('reverse_gap',.20))
+    reverse_mode=(recent['n20']>=rmin and recent['normal_win_rate']<.43 and
+                  recent['reverse_win_rate']-recent['normal_win_rate']>=gap)
+    recovery=((recent['n50']>=40 and recent['wr50']<.44) or
+              (recent['n20']>=20 and recent['wr20']<.38) or recent['loss_streak']>=5)
+    final=_opp(raw) if reverse_mode else raw
+    qvals=[float(x.get('quality',.5)) for x in top[:4]] or [.5];q=sum(qvals)/len(qvals)
+    conf=50+max(0,q-.5)*88+max(0,agree-.5)*15
+    if recent['n20']>=12:conf+=(recent['wr20']-.5)*18
+    if recovery:conf-=7
+    if reverse_mode:conf-=3
+    top_quality=max((float(x.get('quality',.5)) for x in top),default=.5)
+    if agree<.56:conf=min(conf,54)
+    if top_quality<.525:conf=min(conf,55)
+    elif top_quality<.545:conf=min(conf,59)
+    conf=_clamp(conf,45,72);display=int(round(_clamp(conf+3,48,74)))
     anti=_anti_phase(board)
-    mode='RECOVERY + REVERSE' if recovery and reverse_mode else 'RECOVERY' if recovery else 'REVERSE' if reverse_mode else 'FORCED'
-    rank=sorted(
-        ({'name':n,'score':stats[n]['performance_score'],
-          'w20':round(stats[n]['short']['win_rate'],3),'n20':stats[n]['short']['total'],
-          'w50':round(stats[n]['mid']['win_rate'],3),'n50':stats[n]['mid']['total'],
-          'valid':stats[n]['valid']} for n in STRATEGY_NAMES if n in stats),
-        key=lambda x:x['score'],reverse=True
-    )
-    fusion.update({
-        'prediction':final,'raw_prediction':raw,'confidence':display,'percent':display,
-        'model_confidence':model_conf,'strategy_champion':champion,
-        'strategy_predictions':{k:v['prediction'] for k,v in preds.items()},
-        'strategy_reasons':{k:v['reason'] for k,v in preds.items()},
-        'strategy_rankings':rank,'recovery_mode':bool(recovery),'reverse_mode':bool(reverse_mode),'mode':mode,
-        'anti_tai':anti['anti_tai'],'anti_xiu':anti['anti_xiu'],
-        'normal_win_rate':round(recent['normal_win_rate'],4),'reverse_win_rate':round(recent['reverse_win_rate'],4),
-        'final_loss_streak':recent['loss_streak'],'status':_status_from_conf(model_conf,st),
-        'engine':'CHAMPION 15 STRATEGY + FUSION V33','totalStrategies':len(STRATEGY_NAMES),'updated_at':time.time()
-    })
+    mode='RECOVERY + REVERSE' if recovery and reverse_mode else 'RECOVERY' if recovery else 'REVERSE' if reverse_mode else decision_mode
+    rank=[]
+    for n in STRATEGY_NAMES:
+        if n not in preds:continue
+        rank.append({'name':n,'quality':round(_combined_quality(board,n,live,wf),4),
+                     'wf20':round(float(wf.get(n,{}).get('short',{}).get('raw_win_rate',.5)),3),
+                     'wfN':int(wf.get(n,{}).get('short',{}).get('total',0)),
+                     'live20':round(float(live.get(n,{}).get('short',{}).get('win_rate',.5)),3),
+                     'liveN':int(live.get(n,{}).get('short',{}).get('total',0)),
+                     'prediction':preds[n]['prediction']})
+    rank.sort(key=lambda x:x['quality'],reverse=True)
+    if conf>=63 and agree>=.62:status='MẠNH'
+    elif conf>=56:status='TRUNG BÌNH'
+    elif conf>=49:status='YẾU'
+    else:status='NGUY HIỂM'
+    if max((x.get('wfN',0) for x in rank),default=0)<18 and status in ('MẠNH','TRUNG BÌNH'):status='YẾU'
+    fusion.update({'prediction':final,'raw_prediction':raw,'confidence':display,'percent':display,
+      'model_confidence':round(conf,2),'strategy_champion':decision,'champion_raw':champion,
+      'strategy_predictions':{k:v['prediction'] for k,v in preds.items()},
+      'strategy_reasons':{k:v['reason'] for k,v in preds.items()},'strategy_rankings':rank,
+      'meta_top':top[:4],'meta_agreement':round(agree,4),'decision_mode':decision_mode,
+      'board_profile':prof.get('mode','consensus'),'recovery_mode':bool(recovery),'reverse_mode':bool(reverse_mode),'mode':mode,
+      'anti_tai':anti['anti_tai'],'anti_xiu':anti['anti_xiu'],'normal_win_rate':round(recent['normal_win_rate'],4),
+      'reverse_win_rate':round(recent['reverse_win_rate'],4),'final_loss_streak':recent['loss_streak'],'status':status,
+      'sicbo_hash':sicbo_hash if board=='sunwin:sicbo' else None,
+      'sicbo_dice_meta':sicbo_dice if board=='sunwin:sicbo' else None,
+      'engine':'BOARD-META 18 + SICBO HASH META V37','totalStrategies':len(STRATEGY_NAMES),'updated_at':time.time()})
     return fusion
+
 
 def log_strategy_predictions(board,session,model):
     preds=(model or {}).get('strategy_predictions') or {}
@@ -1437,6 +1758,23 @@ async def poll_board(client, board, cfg):
             await set_state(board,True)
             return
 
+        if cfg['kind']=='sicbo_pair':
+            current_task=fetch_first(client,[cfg.get('current')]+cfg.get('current_fallbacks',[]))
+            history_task=fetch_json(client,cfg['history']) if cfg.get('history') else asyncio.sleep(0,result=None)
+            current_pack,history_raw=await asyncio.gather(current_task,history_task,return_exceptions=True)
+            current_raw=current_pack[0] if not isinstance(current_pack,Exception) else current_pack
+            current_rows=[] if isinstance(current_raw,Exception) else parse_sicbo(current_raw)
+            history_rows=[] if isinstance(history_raw,Exception) or history_raw is None else parse_sicbo(history_raw)
+            anchor=_current_anchor(current_rows)
+            if anchor is None:
+                raise current_pack if isinstance(current_pack,Exception) else RuntimeError('Sicbo current API không có phiên hợp lệ')
+            live_rows=history_rows+current_rows
+            await store_rows(board,live_rows)
+            _settle_predictions(board,live_rows)
+            await set_state(board,True)
+            await refresh_shared_prediction(board,anchor)
+            return
+
         if cfg['kind']=='tx_pair':
             current_task=fetch_first(client,[cfg.get('current')]+cfg.get('current_fallbacks',[]))
             history_task=fetch_json(client,cfg['history']) if cfg.get('history') else asyncio.sleep(0,result=None)
@@ -1545,12 +1883,50 @@ def is_admin(chat_id):
     except:return False
 
 
+def _access_row(chat_id):
+    with sqlite3.connect(DB_PATH) as db:
+        return db.execute(
+            'SELECT enabled,granted_by,updated_at,expires_at,access_label,purchased_at FROM bot_access WHERE chat_id=?',
+            (int(chat_id),)
+        ).fetchone()
+
+def _duration_seconds(token):
+    t=str(token or '').strip().lower().replace(' ','')
+    if t in ('forever','life','lifetime','vv','vinhvien','vĩnhviễn','0'): return None
+    aliases={'1day':'1d','7day':'7d','30day':'30d','1ngay':'1d','7ngay':'7d','30ngay':'30d'}
+    t=aliases.get(t,t); m=re.fullmatch(r'(\d+)(m|h|d|w)',t)
+    if not m: raise ValueError('duration')
+    n=int(m.group(1)); unit=m.group(2)
+    if n<=0: raise ValueError('duration')
+    return n*{'m':60,'h':3600,'d':86400,'w':604800}[unit]
+
+def _fmt_remaining(seconds):
+    if seconds is None:return 'VĨNH VIỄN'
+    sec=max(0,int(seconds)); d,sec=divmod(sec,86400); h,sec=divmod(sec,3600); m,_=divmod(sec,60)
+    if d:return f'{d}d {h}h {m}m'
+    if h:return f'{h}h {m}m'
+    return f'{m}m'
+
+def access_info(chat_id):
+    if is_admin(chat_id): return {'active':True,'expires_at':None,'remaining':None,'label':'ADMIN','enabled':True}
+    if not BOT_REQUIRE_ACCESS: return {'active':True,'expires_at':None,'remaining':None,'label':'OPEN','enabled':True}
+    r=_access_row(chat_id)
+    if not r:return {'active':False,'expires_at':None,'remaining':0,'label':'NONE','enabled':False}
+    enabled,granted_by,updated_at,expires_at,label,purchased_at=r; now=time.time()
+    expired=expires_at is not None and float(expires_at)<=now
+    if enabled and expired:
+        with sqlite3.connect(DB_PATH) as db:
+            db.execute('UPDATE bot_access SET enabled=0,updated_at=? WHERE chat_id=?',(now,int(chat_id)))
+            db.execute('UPDATE bot_subscriptions SET enabled=0 WHERE chat_id=?',(int(chat_id),));db.commit()
+        enabled=0
+    remaining=None if expires_at is None else max(0,float(expires_at)-now)
+    return {'active':bool(enabled) and not expired,'expires_at':expires_at,'remaining':remaining,
+            'label':label or 'manual','enabled':bool(enabled),'granted_by':granted_by,'updated_at':updated_at,'purchased_at':purchased_at}
+
 def has_access(chat_id):
     if is_admin(chat_id): return True
     if not BOT_REQUIRE_ACCESS: return True
-    with sqlite3.connect(DB_PATH) as db:
-        r=db.execute('SELECT enabled FROM bot_access WHERE chat_id=?',(int(chat_id),)).fetchone()
-    return bool(r and r[0])
+    return bool(access_info(chat_id).get('active'))
 
 
 FEATURES=('predict','history','ai','auto')
@@ -1623,78 +1999,90 @@ def set_feature(chat_id,feature,enabled,admin_id=None):
         db.commit()
 
 
-def grant_access(chat_id,admin_id=None,enabled=True,preset=None):
+def grant_access(chat_id,admin_id=None,enabled=True,preset=None,expires_at=None,access_label=None):
+    now=time.time()
     with sqlite3.connect(DB_PATH) as db:
         db.execute(
-            '''INSERT INTO bot_access(chat_id,enabled,granted_by,updated_at) VALUES(?,?,?,?)
+            """INSERT INTO bot_access(chat_id,enabled,granted_by,updated_at,expires_at,access_label,purchased_at)
+               VALUES(?,?,?,?,?,?,?)
                ON CONFLICT(chat_id) DO UPDATE SET enabled=excluded.enabled,
-               granted_by=excluded.granted_by,updated_at=excluded.updated_at''',
-            (int(chat_id),1 if enabled else 0,int(admin_id) if admin_id is not None else None,time.time())
+               granted_by=excluded.granted_by,updated_at=excluded.updated_at,
+               expires_at=excluded.expires_at,access_label=excluded.access_label,
+               purchased_at=COALESCE(bot_access.purchased_at,excluded.purchased_at)""",
+            (int(chat_id),1 if enabled else 0,int(admin_id) if admin_id is not None else None,now,
+             expires_at,access_label or ('manual' if enabled else 'locked'),now if enabled else None)
         )
-        if not enabled:
-            db.execute('UPDATE bot_subscriptions SET enabled=0 WHERE chat_id=?',(int(chat_id),))
+        if not enabled: db.execute('UPDATE bot_subscriptions SET enabled=0 WHERE chat_id=?',(int(chat_id),))
         db.commit()
-    if enabled and preset:
-        set_preset(chat_id,preset,admin_id)
+    if enabled and preset:set_preset(chat_id,preset,admin_id)
+
+def grant_timed_access(chat_id,duration='1d',admin_id=None,extend=False):
+    seconds=_duration_seconds(duration); now=time.time(); cur=access_info(chat_id)
+    if seconds is None:
+        expires_at=None; label='LIFETIME'
+    else:
+        base=now
+        if extend and cur.get('expires_at') and float(cur['expires_at'])>now: base=float(cur['expires_at'])
+        expires_at=base+seconds; label=str(duration).upper()
+    grant_access(chat_id,admin_id,True,'vip',expires_at,label)
+    return access_info(chat_id)
+
+def admin_user_keyboard(uid):
+    uid=int(uid)
+    return {'inline_keyboard':[
+        [{'text':'＋ 1 DAY','callback_data':f'uadd|{uid}|1d'},{'text':'＋ 7 DAYS','callback_data':f'uadd|{uid}|7d'}],
+        [{'text':'＋ 30 DAYS','callback_data':f'uadd|{uid}|30d'},{'text':'♾ VĨNH VIỄN','callback_data':f'ulife|{uid}'}],
+        [{'text':'🔒 KHÓA USER','callback_data':f'ulock|{uid}'},{'text':'↻ XEM LẠI','callback_data':f'uinfo|{uid}'}],
+        [{'text':'‹ ADMIN','callback_data':'adminhome'}]
+    ]}
 
 
 def permission_text(chat_id):
-    p=get_permissions(chat_id)
-    status='ADMIN' if is_admin(chat_id) else ('MỞ' if has_access(chat_id) else 'KHÓA')
+    p=get_permissions(chat_id); info=access_info(chat_id)
+    status='ADMIN' if is_admin(chat_id) else ('ĐANG DÙNG' if info.get('active') else 'HẾT HẠN / KHÓA')
     ico=lambda v:'✅' if v else '🔒'
-    return (f"🔐 QUYỀN USER {chat_id}\n"
-            f"Trạng thái: {status} · gói {str(p.get('preset','-')).upper()}\n"
-            f"{ico(p['predict'])} Dự đoán\n"
-            f"{ico(p['history'])} Lịch sử\n"
-            f"{ico(p['ai'])} GPT Deep Analysis\n"
-            f"{ico(p['auto'])} AUTO thông báo")
+    if is_admin(chat_id): exp='VĨNH VIỄN'
+    elif info.get('expires_at') is None and info.get('active'): exp='VĨNH VIỄN'
+    elif info.get('expires_at'): exp=time.strftime('%d/%m/%Y %H:%M',time.localtime(float(info['expires_at'])))+' · còn '+_fmt_remaining(info.get('remaining'))
+    else: exp='---'
+    return (f"👤 USER {chat_id}\n{BOT_DIV}\nTrạng thái: {status}\n"
+            f"Gói: {str(p.get('preset','-')).upper()} · {info.get('label','-')}\nHạn dùng: {exp}\n"
+            f"{ico(p['predict'])} Dự đoán  {ico(p['history'])} Lịch sử\n{ico(p['ai'])} GPT  {ico(p['auto'])} AUTO\n"
+            f"🛡 Admin: {'CÓ' if is_admin(chat_id) else 'KHÔNG'}")
 
 
 def locked_text(chat_id,feature):
-    names={'predict':'Dự đoán','history':'Lịch sử','ai':'GPT Deep Analysis','auto':'AUTO'}
-    return (f"🔒 {names.get(feature,feature)} chưa được mở.\n"
-            f"User ID: {chat_id}\n"
-            f"Admin dùng: /permit {chat_id} {feature}")
+    names={'predict':'Dự đoán','history':'Lịch sử','ai':'GPT Deep Analysis','auto':'AUTO'}; info=access_info(chat_id)
+    if not info.get('active'):
+        return (f"⛔ QUYỀN SỬ DỤNG ĐÃ HẾT\n{BOT_DIV}\nUser ID: {chat_id}\n"
+                "Liên hệ admin để gia hạn 1D / 7D / 30D / Vĩnh viễn.")
+    return (f"🔒 {names.get(feature,feature)} chưa được mở.\nUser ID: {chat_id}\nAdmin dùng: /permit {chat_id} {feature}")
 
 
 def admin_help():
-    return ('🛠 ADMIN V33 · HISTORY + CẦU\n'
-            '━━ CẤP QUYỀN ━━\n'
-            '/grant <id> · BASIC = dự đoán\n'
-            '/grantpro <id> · PRO = dự đoán + lịch sử + auto\n'
-            '/grantvip <id> · VIP = full + GPT\n'
-            '/permit <id> <predict|history|ai|auto>\n'
-            '/deny <id> <predict|history|ai|auto>\n'
-            '/perms <id> · xem quyền\n'
-            '/lock <id> · tắt toàn bộ user\n'
-            '/unlock <id> [basic|pro|vip] · mở lại\n'
-            '/revoke <id> · alias /lock\n'
-            '/users · danh sách user\n'
-            '━━ HỆ THỐNG ━━\n'
-            '/background · xem trạng thái nền 24/7\n'
-            '/start · mở menu; nền 24/7 vẫn tự chạy\n'
-            '/health · /stats · /engine [board] · /deep [board]\n'
-            '/testapi <board> · /apis\n'
-            '/setapi <board> <current_url> [history_url]\n'
-            '/resetapi <board>\n'
-            'VD board: hitclub:hu · hitclub:md5 · sunwin:sicbo · lc79:xocdia · max789:md5')
+    return (f"◆ QUẢN LÝ USER · {BOT_UI_VERSION}\n{BOT_DIV}\n"
+            "🎟 CẤP FULL USER (không có quyền admin)\n/adduser ID 1d\n/adduser ID 7d\n/adduser ID 30d\n"
+            "/lifetime ID\n/extend ID 7d\n/userinfo ID\n/users\n/lock ID\n\n"
+            "⏱ Thời gian: 30m · 12h · 1d · 7d · 30d · 4w · forever\n\n"
+            "🔧 QUYỀN TÙY CHỈNH\n/permit ID predict|history|ai|auto\n/deny ID predict|history|ai|auto\n/perms ID\n\n"
+            "⚙️ HỆ THỐNG\n/background · /health · /stats\n/engine [board] · /deep [board]\n"
+            "/testapi <board> · /apis\n/setapi <board> <current_url> [history_url]\n/resetapi <board>")
 
 
 def user_help(chat_id):
     p=get_permissions(chat_id)
-    lines=['📖 LỆNH BOT','/games · chọn game/bàn','/status · xem dự đoán','/me · xem quyền','/id · xem User ID']
-    if p.get('history'):
-        lines.append('/history · lịch sử đúng/sai')
-        lines.append('/results · kết quả game')
-        lines.append('/historyall · lịch sử tất cả game')
-    if p.get('ai'): lines.append('/ai · GPT Deep Analysis')
-    if p.get('auto'): lines.append('/auto · bật/tắt AUTO bàn đang chọn')
+    lines=[f"✦ HƯỚNG DẪN · {BOT_UI_VERSION}",BOT_DIV,
+           "/start · bảng điều khiển","/games · danh sách game","/status · dự đoán bàn đang chọn",
+           "/me · quyền tài khoản","/id · User ID"]
+    if p.get('history'):lines += ["/history · đúng/sai","/results · KQ game","/historyall · toàn bộ game"]
+    if p.get('ai'):lines.append("/ai · GPT phân tích")
+    if p.get('auto'):lines.append("/auto · bật/tắt AUTO")
     return '\n'.join(lines)
 
 def admin_health_text():
     with sqlite3.connect(DB_PATH) as db:
         state={b:(u,ok,err) for b,u,ok,err in db.execute('SELECT board,updated_at,source_ok,last_error FROM board_state')}
-    now=time.time();lines=['🩺 API HEALTH · V33']
+    now=time.time();lines=['🩺 API HEALTH · V37']
     for b in BOARDS:
         u,ok,err=state.get(b,(0,0,'chưa có dữ liệu'))
         age=max(0,int(now-u)) if u else -1
@@ -1717,7 +2105,7 @@ def admin_stats_text():
         wins=db.execute('SELECT COUNT(*) FROM shared_predictions WHERE ok=1').fetchone()[0]
         boards=db.execute('SELECT COUNT(DISTINCT board) FROM rounds').fetchone()[0]
     hit=(wins/settled*100) if settled else 0.0
-    return (f"📊 STATS V33\nUser mở: {active}/{users} · AI {ai_users} · LS {hist_users} · AUTO {auto_users}\n"
+    return (f"📊 STATS V37\nUser mở: {active}/{users} · AI {ai_users} · LS {hist_users} · AUTO {auto_users}\n"
             f"Board có dữ liệu: {boards}\nRound đang lưu: {rounds}\n"
             f"Prediction: {preds} · đã chốt {settled}\n"
             f"Đúng lịch sử: {wins}/{settled} ({hit:.1f}%)\n"
@@ -1739,8 +2127,15 @@ def engine_diag_text(board):
         lines.append(f"Online ML: P(TÀI) {round(ml.get('p_tai',.5)*100)}% · val {round(ml.get('val_accuracy',.5)*100)}% · Brier {ml.get('brier',.25)}")
     else:lines.append('Online ML: đang tích mẫu')
     if m.get('strategy_champion'):
-        lines.append(f"Champion: {m.get('strategy_champion')} · {m.get('mode','FORCED')} · {m.get('status','---')}")
-        lines.append(f"Normal W20: {round(float(m.get('normal_win_rate',.5))*100,1)}% · Reverse: {round(float(m.get('reverse_win_rate',.5))*100,1)}%")
+        lines.append(f"Decision: {m.get('strategy_champion')} · {m.get('mode','BOARD_META')} · {m.get('status','---')}")
+        lines.append(f"Meta agree: {round(float(m.get('meta_agreement',.5))*100,1)}% · Normal W20 {round(float(m.get('normal_win_rate',.5))*100,1)}%")
+        if m.get('meta_top'): lines.append('Board top: '+', '.join(f"{x.get('name')} {round(float(x.get('quality',.5))*100,1)}%" for x in m.get('meta_top',[])[:4]))
+    if board=='sunwin:sicbo':
+        hs=m.get('sicbo_hash') or {};ds=m.get('sicbo_dice_meta') or {}
+        if hs:
+            lines.append(f"Hash meta: {'ON' if hs.get('usable') else 'HỌC'} · sample {hs.get('sample',0)} · quality {round(float(hs.get('quality',.5))*100,1)}% · {display_pred(board,hs.get('prediction'))}")
+        if ds.get('ready'):
+            lines.append(f"Dice meta: {display_pred(board,ds.get('prediction'))} · quality {round(float(ds.get('quality',.5))*100,1)}%")
     if top:
         lines.append('Top signal: '+', '.join(f"{x['name']}({x['score']:+.2f})" for x in top[:6]))
     return '\n'.join(lines)[:4000]
@@ -1755,7 +2150,10 @@ async def admin_test_api(client,board):
             tables=parse_baccarat(data);count=sum(len(v) for v in tables.values())
             latest=max((_session_num(r.get('id')) or 0 for arr in tables.values() for r in arr),default=0)
         else:
-            rows=parse_xocdia(data) if cfg.get('kind')=='xocdia' else parse_tx(data)
+            kind=cfg.get('kind')
+            rows=(parse_xocdia(data) if kind=='xocdia'
+                  else parse_sicbo(data) if kind in ('sicbo','sicbo_pair')
+                  else parse_tx(data))
             count=len(rows);latest=_current_anchor(rows) or (rows[-1]['id'] if rows else '---')
         ms=round((time.perf_counter()-t0)*1000)
         return f"✅ TEST API {board_label(board)}\n{ms} ms · rows {count} · phiên {latest}\n{url}"
@@ -1811,72 +2209,184 @@ def game_cau_overview(game):
     return '\n'.join(lines)[:3500]
 
 
+BOT_UI_VERSION='V37'
+BOT_DIV='━━━━━━━━━━━━━━━━━━'
+
+def _board_source(board):
+    with sqlite3.connect(DB_PATH) as db:
+        r=db.execute('SELECT updated_at,source_ok,last_error FROM board_state WHERE board=?',(board,)).fetchone()
+    if not r:return {'icon':'⚪','ok':False,'age':None,'error':'chưa có dữ liệu'}
+    updated,ok,err=r
+    age=max(0,int(time.time()-updated)) if updated else None
+    fresh=bool(ok) and age is not None and age<=max(18,int(POLL_SECONDS*10))
+    return {'icon':'🟢' if fresh else ('🟡' if ok else '🔴'),'ok':bool(ok),'age':age,'error':err}
+
+def _short_board_label(board):
+    game=board.split(':',1)[0]; label=board_label(board)
+    if game!='baccarat':
+        game_name=GAME_TITLES.get(game,game).split(' ',1)[-1]
+        label=label.replace(game_name+' ','')
+    else: label=label.replace('BACCARAT · ','')
+    return label
+
+def _compact_cau(board,limit=7):
+    return current_cau(board,limit)['text'].replace(' ','')
+
+def _selected_summary(chat_id):
+    board=get_selected_board(chat_id)
+    if not board or board not in available_bot_boards():return 'Chưa chọn bàn'
+    pred=get_shared_prediction(board)
+    if not pred:return f"{board_label(board)} · đang đồng bộ"
+    return f"{board_label(board)} · #{pred.get('session','---')} → {display_pred(board,pred.get('prediction'))} {pred.get('confidence',50)}%"
+
+def bot_home_text(chat_id):
+    p=get_permissions(chat_id)
+    preset='ADMIN' if is_admin(chat_id) else str(p.get('preset','BASIC')).upper()
+    bg=background_status_payload()
+    boards=available_bot_boards()
+    live=sum(1 for b in boards if _board_source(b)['icon']=='🟢')
+    selected=get_selected_board(chat_id)
+    lines=[
+        '✦ TAIXIUTOOL · TELEGRAM ULTRA',BOT_DIV,
+        f"👤 {preset} · ID {chat_id}",
+        f"🎟 HẠN · {_fmt_remaining(access_info(chat_id).get('remaining')) if not is_admin(chat_id) else 'ADMIN'}",
+        f"♾ NỀN 24/7 · {'LIVE' if bg.get('active') else 'CHỜ'}",
+        f"📡 NGUỒN API · {live}/{len(boards)} board live",
+        '🧠 ENGINE · BOARD-META 18','',
+        f"🎮 ĐANG CHỌN · {_selected_summary(chat_id)}"
+    ]
+    if selected and selected in boards:
+        c=current_cau(selected,10)
+        if c['count']:
+            lines.append(f"〽️ CẦU · {c['text']}")
+            lines.append(c['icons'])
+    lines += ['', 'Chọn game bên dưới để mở bảng điều khiển.']
+    return '\n'.join(lines)[:4000]
+
+def bot_game_text(game,chat_id):
+    boards=boards_for_game(game)
+    lines=[f"{GAME_TITLES.get(game,game)} · TRUNG TÂM GAME",BOT_DIV]
+    for board in boards:
+        src=_board_source(board); rows=load_rows(board,1); latest=rows[-1] if rows else None
+        pred=get_shared_prediction(board)
+        latest_txt=f"#{latest.get('id')} {display_pred(board,latest.get('result'))}" if latest else 'chưa có KQ'
+        pred_txt=f"#{pred.get('session')} {display_pred(board,pred.get('prediction'))} {pred.get('confidence')}%" if pred else 'đang học'
+        lines.append(f"{src['icon']} {_short_board_label(board)}")
+        lines.append(f"   KQ {latest_txt} · NEXT {pred_txt}")
+        c=current_cau(board,8)
+        if c['count']:lines.append(f"   〽️ {c['text']}")
+    lines += ['', 'Chọn bàn để mở dashboard chi tiết.']
+    return '\n'.join(lines)[:4000]
+
+def bot_cau_text(board,limit=24):
+    c=current_cau(board,limit); rows=load_rows(board,max(30,limit))[-limit:]
+    lines=[f"〽️ CẦU · {board_label(board)}",BOT_DIV]
+    if not rows:return '\n'.join(lines+['Chưa có dữ liệu.'])
+    lines.append(c['text'])
+    if c['icons']:lines.append(c['icons'])
+    vals=[r.get('result') for r in rows if r.get('result') in ('TÀI','XỈU')]
+    rs=_run_stats(vals)
+    if rs.get('current'):lines.append(f"Nhịp hiện tại: {display_pred(board,rs.get('current_side'))} ×{rs.get('current')}")
+    lines.append(f"Mẫu: {len(vals)} phiên gần nhất")
+    return '\n'.join(lines)[:4000]
+
+def bot_account_text(chat_id):
+    p=get_permissions(chat_id);board=get_selected_board(chat_id);info=access_info(chat_id)
+    if is_admin(chat_id):expiry='VĨNH VIỄN · ADMIN'
+    elif info.get('expires_at') is None and info.get('active'):expiry='VĨNH VIỄN'
+    elif info.get('expires_at'):expiry=time.strftime('%d/%m %H:%M',time.localtime(float(info['expires_at'])))+f" · còn {_fmt_remaining(info.get('remaining'))}"
+    else:expiry='HẾT HẠN'
+    return (f"👤 TÀI KHOẢN\n{BOT_DIV}\nID: {chat_id}\n"
+            f"Gói: {'ADMIN' if is_admin(chat_id) else str(p.get('preset','-')).upper()}\n🎟 Hạn: {expiry}\n"
+            f"{'✅' if p.get('predict') else '🔒'} Dự đoán  {'✅' if p.get('history') else '🔒'} Lịch sử\n"
+            f"{'✅' if p.get('ai') else '🔒'} GPT  {'✅' if p.get('auto') else '🔒'} AUTO\n"
+            f"🎮 Bàn: {board_label(board) if board else 'chưa chọn'}")
+
+
+def bot_admin_home_text():
+    bg=background_status_payload()
+    with sqlite3.connect(DB_PATH) as db:
+        users=db.execute('SELECT COUNT(*) FROM bot_access WHERE enabled=1').fetchone()[0]
+        settled=db.execute('SELECT COUNT(*) FROM shared_predictions WHERE actual IS NOT NULL').fetchone()[0]
+        wins=db.execute('SELECT COUNT(*) FROM shared_predictions WHERE ok=1').fetchone()[0]
+    rate=round(wins/settled*100,1) if settled else 0
+    boards=available_bot_boards();live=sum(1 for b in boards if _board_source(b)['icon']=='🟢')
+    return (f"◆ ADMIN CONTROL · {BOT_UI_VERSION}\n{BOT_DIV}\n"
+            f"♾ Worker 24/7: {'LIVE' if bg.get('active') else 'CHỜ'}\n"
+            f"📡 API: {live}/{len(boards)} live\n"
+            f"👥 User active: {users}\n"
+            f"🎟 /adduser ID 1d|7d|30d\n"
+            f"📊 Lịch sử chốt: {settled} · ✅ {rate}%\n"
+            f"🧠 Engine: BOARD-META 18\n\nChọn bảng điều khiển:")
+
+async def tg_panel(client,q,text,reply_markup=None):
+    msg=(q or {}).get('message') or {};chat_id=(msg.get('chat') or {}).get('id');message_id=msg.get('message_id')
+    if not chat_id:return None
+    payload={'chat_id':chat_id,'message_id':message_id,'text':text,'disable_web_page_preview':True}
+    if reply_markup is not None:payload['reply_markup']=reply_markup
+    try:
+        url=f'https://api.telegram.org/bot{BOT_TOKEN}/editMessageText'
+        r=await client.post(url,json=payload,timeout=30);data=r.json()
+        if data.get('ok'):return data.get('result')
+        if 'message is not modified' in str(data.get('description','')).lower():return msg
+    except Exception:pass
+    send={'chat_id':chat_id,'text':text,'disable_web_page_preview':True}
+    if reply_markup is not None:send['reply_markup']=reply_markup
+    return await tg_call(client,'sendMessage',send)
+
 def bot_games_keyboard(chat_id):
     available={b.split(':',1)[0] for b in available_bot_boards()}
     buttons=[{'text':GAME_TITLES[g],'callback_data':'game|'+g} for g in GAME_ORDER if g in available]
     rows=[buttons[i:i+2] for i in range(0,len(buttons),2)]
+    quick=[]
+    if get_permissions(chat_id).get('history'):quick.append({'text':'📚 LS ALL','callback_data':'histall'})
+    quick.append({'text':'👤 TÀI KHOẢN','callback_data':'account'})
+    rows.append(quick)
     if feature_allowed(chat_id,'auto'):
-        rows.append([{'text':'✅ AUTO ALL','callback_data':'allon'},{'text':'⛔ TẮT ALL','callback_data':'alloff'}])
-    if get_permissions(chat_id).get('history'):
-        rows.append([{'text':'📚 LỊCH SỬ ALL','callback_data':'histall'}])
-    rows.append([{'text':'🔐 QUYỀN','callback_data':'perm'},{'text':'📖 LỆNH','callback_data':'help'}])
+        rows.append([{'text':'🔔 AUTO ALL','callback_data':'allon'},{'text':'🔕 TẮT ALL','callback_data':'alloff'}])
+    if is_admin(chat_id):rows.append([{'text':'◆ ADMIN','callback_data':'adminhome'}])
     return {'inline_keyboard':rows}
-
 
 def bot_game_keyboard(game,chat_id):
-    boards=boards_for_game(game); rows=[]
-    for i in range(0,len(boards),2):
-        row=[]
-        for b in boards[i:i+2]:
-            dot='🟢' if sub_enabled(chat_id,b) else '⚪'
-            label=board_label(b)
-            if game!='baccarat':
-                game_name=GAME_TITLES.get(game,game).split(' ',1)[-1]
-                label=label.replace(game_name+' ','')
-            else:
-                label=label.replace('BACCARAT · ','')
-            c=current_cau(b,6)['text'].replace(' ','')
-            row.append({'text':f'{dot} {label} · {c}','callback_data':'sel|'+b})
-        rows.append(row)
-    rows.append([{'text':'⬅️ TẤT CẢ GAME','callback_data':'games'}])
+    rows=[]
+    for board in boards_for_game(game):
+        src=_board_source(board);auto='🔔' if sub_enabled(chat_id,board) else '▫️'
+        rows.append([{'text':f"{src['icon']} {auto} {_short_board_label(board)} · {_compact_cau(board,6)}",
+                      'callback_data':'sel|'+board}])
+    rows.append([{'text':'⌂ HOME','callback_data':'home'},{'text':'🎮 TẤT CẢ GAME','callback_data':'games'}])
     return {'inline_keyboard':rows}
-
 
 def bot_board_keyboard(board,chat_id=None):
     p=get_permissions(chat_id) if chat_id is not None else {'predict':True,'history':True,'ai':True,'auto':True}
-    r1=[
-        {'text':'🎯 XEM' if p.get('predict') else '🔒 XEM',
-         'callback_data':(('now|' if p.get('predict') else 'locked|predict|')+board)},
-        {'text':'🧠 GPT' if p.get('ai') else '🔒 GPT',
-         'callback_data':(('ai|' if p.get('ai') else 'locked|ai|')+board)}
-    ]
     on=sub_enabled(chat_id,board) if chat_id is not None and p.get('auto') else False
-    r2=[
-        {'text':'📜 ĐÚNG/SAI' if p.get('history') else '🔒 ĐÚNG/SAI',
-         'callback_data':(('hist|' if p.get('history') else 'locked|history|')+board)},
-        {'text':'🧾 KQ GAME' if p.get('history') else '🔒 KQ GAME',
-         'callback_data':(('rounds|' if p.get('history') else 'locked|history|')+board)}
-    ]
-    r3=[
-        {'text':('🔕 TẮT AUTO' if on else '🔔 BẬT AUTO') if p.get('auto') else '🔒 AUTO',
-         'callback_data':(('auto|' if p.get('auto') else 'locked|auto|')+board)},
-        {'text':'📚 LS ALL' if p.get('history') else '🔒 LS ALL',
-         'callback_data':'histall' if p.get('history') else 'locked|history|'+board}
-    ]
     game=board.split(':',1)[0]
-    r4=[{'text':'⬅️ '+GAME_TITLES.get(game,game),'callback_data':'game|'+game},
-        {'text':'🎮 GAME','callback_data':'games'}]
-    return {'inline_keyboard':[r1,r2,r3,r4]}
-
+    rows=[
+      [{'text':'↻ LÀM MỚI' if p.get('predict') else '🔒 DỰ ĐOÁN',
+        'callback_data':(('now|' if p.get('predict') else 'locked|predict|')+board)},
+       {'text':('🔕 AUTO ON' if on else '🔔 AUTO OFF') if p.get('auto') else '🔒 AUTO',
+        'callback_data':(('auto|' if p.get('auto') else 'locked|auto|')+board)}],
+      [{'text':'📜 ĐÚNG/SAI' if p.get('history') else '🔒 LỊCH SỬ',
+        'callback_data':(('hist|' if p.get('history') else 'locked|history|')+board)},
+       {'text':'🧾 KẾT QUẢ' if p.get('history') else '🔒 KẾT QUẢ',
+        'callback_data':(('rounds|' if p.get('history') else 'locked|history|')+board)}],
+      [{'text':'〽️ CẦU 24','callback_data':'cau|'+board},
+       {'text':'🧠 GPT' if p.get('ai') else '🔒 GPT',
+        'callback_data':(('ai|' if p.get('ai') else 'locked|ai|')+board)}]
+    ]
+    if is_admin(chat_id):rows.append([{'text':'⚙️ ENGINE DIAG','callback_data':'diag|'+board}])
+    rows.append([{'text':'‹ '+GAME_TITLES.get(game,game),'callback_data':'game|'+game},
+                 {'text':'⌂ HOME','callback_data':'home'}])
+    return {'inline_keyboard':rows}
 
 def bot_admin_keyboard():
     return {'inline_keyboard':[
-        [{'text':'👥 QUYỀN','callback_data':'adm|permhelp'},{'text':'📊 STATS','callback_data':'adm|stats'}],
-        [{'text':'♾ NỀN 24/7','callback_data':'adm|background'},{'text':'🩺 API HEALTH','callback_data':'adm|health'}],
-        [{'text':'🔗 API LINKS','callback_data':'adm|apis'},{'text':'🧠 ENGINE','callback_data':'adm|engine'}],
-        [{'text':'🧮 DEEP','callback_data':'adm|deep'},{'text':'🎮 GAME MENU','callback_data':'games'}]
+      [{'text':'🎟 QUẢN LÝ USER','callback_data':'adm|permhelp'},{'text':'📊 THỐNG KÊ','callback_data':'adm|stats'}],
+      [{'text':'📡 API HEALTH','callback_data':'adm|health'},{'text':'♾ NỀN 24/7','callback_data':'adm|background'}],
+      [{'text':'🧠 ENGINE','callback_data':'adm|engine'},{'text':'🧮 DEEP','callback_data':'adm|deep'}],
+      [{'text':'🔗 API LINKS','callback_data':'adm|apis'},{'text':'🎲 SICBO API','callback_data':'adm|sicboapi'}],
+      [{'text':'🎮 GAME','callback_data':'games'}],
+      [{'text':'⌂ HOME','callback_data':'home'}]
     ]}
-
 
 def history_stats(board,limit=100):
     h=get_prediction_history(board,limit)
@@ -1927,7 +2437,7 @@ def format_round_history(board,limit=12):
 
 
 def format_all_history(limit_per_board=40):
-    lines=['📚 LỊCH SỬ ALL GAME · ĐÚNG/SAI']
+    lines=['📚 LỊCH SỬ ALL GAME · HÚP/GÃY']
     count=0
     for b in available_bot_boards():
         st=history_stats(b,limit_per_board)
@@ -2058,7 +2568,7 @@ def build_timeout_report(run):
     report={'type':'TAIXIUTOOL_AUTO_TRAIN_2H_REPORT','version':'V28','run_id':run['id'],
             'admin_chat_id':run['admin_chat_id'],'started_at':start,'ends_at':end,
             'duration_seconds':int(end-start),'generated_at':time.time(),
-            'engine':'CHAMPION 15 STRATEGY + FUSION V33','boards':{},
+            'engine':'BOARD-META 18 + SICBO HASH META V37','boards':{},
             'totals':{'boards':0,'new_rounds':0,'predictions':0,'settled':0,'wins':0,'losses':0,'pending':0}}
     for board in available_bot_boards():
         rows=load_rows(board,MAX_HISTORY);before=set(str(x) for x in snapshot.get(board,[]))
@@ -2193,46 +2703,52 @@ def background_status_text():
 
 
 def format_prediction(board,pred):
+    src=_board_source(board)
     if not pred:
-        return f'⏳ {board_label(board)} · chưa có dự đoán.'
-    model=pred.get('model') or {}
-    st=history_stats(board,20)
+        return f"◆ {board_label(board)}\n{BOT_DIV}\n{src['icon']} NGUỒN · đang đồng bộ\n⏳ Chưa có dự đoán mới."
+    model=pred.get('model') or {};st=history_stats(board,20)
     acc=f"{st['accuracy']}%" if st['accuracy'] is not None else '--'
-    recent=get_prediction_history(board,8)
-    last=next((x for x in recent if x.get('actual') is not None),None)
+    recent=get_prediction_history(board,10);last=next((x for x in recent if x.get('actual') is not None),None)
     cau=current_cau(board,12)
-    lines=[f"🎮 {board_label(board)}",f"〽️ CẦU: {cau['text']}"]
-    if cau['icons']: lines.append(cau['icons'])
+    lines=[f"◆ {board_label(board)}",BOT_DIV,
+           f"{src['icon']} API · {src['age']}s" if src['age'] is not None else f"{src['icon']} API · đang chờ",
+           f"〽️ CẦU · {cau['text']}"]
+    if cau['icons']:lines.append(cau['icons'])
+    lines += ['', '┌ PHIÊN VỪA CHỐT']
     if last:
-        mark='✅ ĐÚNG' if last.get('ok') else '❌ SAI'
-        actual=display_pred(board,last.get('actual'))
-        prev_pred=display_pred(board,last.get('prediction'))
-        lines.append(f"↩️ PHIÊN TRƯỚC #{last.get('session')} · {mark}")
-        lines.append(f"ĐT {prev_pred} → KQ {actual}")
+        lines.append(f"│ #{last.get('session')} · {'🔥 HÚP!!' if last.get('ok') else '💥 GÃY CMNR!!'}")
+        lines.append(f"│ ĐT {display_pred(board,last.get('prediction'))}  →  KQ {display_pred(board,last.get('actual'))}")
         d=last.get('dice') or []
         if len(d)>=3:
-            total=last.get('sum')
-            lines.append(f"🎲 {d[0]} · {d[1]} · {d[2]} = {total if total is not None else sum(d[:3])}")
-        elif last.get('sum') is not None:
-            lines.append(f"🎲 Tổng: {last.get('sum')}")
-        lines.append('')
-    lines.append(f"🎯 PHIÊN MỚI #{pred.get('session','---')}")
-    lines.append(f"→ {display_pred(board,pred.get('prediction'))} · tín hiệu {pred.get('confidence',50)}%")
-    lines.append(f"📊 W20: ✅{st['wins']} ❌{st['losses']} · {acc}")
-    lines.append(f"🧩 {model.get('pattern','---')} · học {model.get('sample',0)} phiên")
+            total=last.get('sum');lines.append(f"│ 🎲 {d[0]} · {d[1]} · {d[2]} = {total if total is not None else sum(d[:3])}")
+        elif last.get('sum') is not None:lines.append(f"│ Tổng {last.get('sum')}")
+    else:lines.append("│ Chưa có prediction đã chốt")
+    lines += ['└────────────────','',
+              '┌ DỰ ĐOÁN TIẾP THEO',
+              f"│ 🎯 #{pred.get('session','---')}",
+              f"│ ➜ {display_pred(board,pred.get('prediction'))}  ·  {pred.get('confidence',50)}%",
+              f"│ 📊 W20  ✅{st['wins']}  ❌{st['losses']}  · {acc}"]
     if model.get('strategy_champion'):
-        lines.append(f"🏆 {model.get('strategy_champion')} · {model.get('mode','FORCED')} · {model.get('status','---')}")
+        mode=model.get('decision_mode') or model.get('mode','BOARD_META')
+        lines.append(f"│ 🧠 {mode} · {model.get('status','---')}")
+        if model.get('meta_agreement') is not None:lines.append(f"│ Đồng thuận {round(float(model.get('meta_agreement',.5))*100)}%")
+        top=model.get('meta_top') or []
+        if top:lines.append("│ Top: "+' · '.join(x.get('name','?') for x in top[:3]))
+        else:lines.append(f"│ {model.get('strategy_champion')}")
+    lines += [f"│ 🧩 {model.get('pattern','---')} · học {model.get('sample',0)} phiên",'└────────────────']
     df=model.get('dice_forecast') or {}
     if board=='sunwin:sicbo':
         if df.get('ready'):
-            faces=df.get('faces',[])[:3]
-            fv=' · '.join(str(x.get('face','?')) for x in faces)
-            lines.append(f"🎲 Sicbo vị dự kiến: {fv} · vùng tổng {df.get('sum_zone','---')}")
+            fv=' · '.join(str(x.get('face','?')) for x in df.get('faces',[])[:3])
+            lines += ['',f"🎲 SICBO · vị {fv} · vùng tổng {df.get('sum_zone','---')}"]
         else:
-            lines.append(f"🎲 Sicbo vị: đang học ({df.get('sample',0)}/18 phiên)")
+            lines += ['',f"🎲 SICBO · đang học {df.get('sample',0)}/18"]
+        hs=model.get('sicbo_hash') or {}
+        if hs.get('ready'):
+            use='ON' if hs.get('usable') else 'HỌC'
+            lines.append(f"🔐 HASH {use} · {display_pred(board,hs.get('prediction'))} · mẫu {hs.get('sample',0)} · calib {round(float(hs.get('quality',.5))*100,1)}%")
     xf=model.get('xocdia_forecast') or {}
-    if board=='lc79:xocdia' and xf:
-        lines.append(f"🔴⚪ {xf.get('label','---')}")
+    if board=='lc79:xocdia' and xf:lines += ['',f"⚪🟣 XÓC ĐĨA · {xf.get('label','---')}"]
     return '\n'.join(lines)[:4000]
 
 
@@ -2243,13 +2759,13 @@ def format_history(board,limit=15):
     st=history_stats(board,max(20,limit))
     acc=f"{st['accuracy']}%" if st['accuracy'] is not None else '--'
     streak=f" · {'✅' if st['streak_ok'] else '❌'}x{st['streak']}" if st['streak'] else ''
-    lines=[f"📜 {board_label(board)} · ✅{st['wins']} ❌{st['losses']} · {acc}{streak}"]
+    lines=[f"📜 {board_label(board)} · LỊCH SỬ",BOT_DIV,f"✅ {st['wins']}  ·  ❌ {st['losses']}  ·  {acc}{streak}"]
     for x in h:
         pred=display_pred(board,x.get('prediction'))
         if x.get('actual') is None:
             mark='⏳';actual='chờ'
         else:
-            mark='✅' if x.get('ok') else '❌';actual=display_pred(board,x.get('actual'))
+            mark='🔥 HÚP!!' if x.get('ok') else '💥 GÃY CMNR!!';actual=display_pred(board,x.get('actual'))
         detail=''
         d=x.get('dice') or []
         if len(d)>=3:
@@ -2525,8 +3041,39 @@ async def bot_handle_message(client,msg):
     if not chat_id: return
 
     if text.startswith('/admin'):
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':admin_help() if is_admin(chat_id) else '⛔ Không có quyền admin.',
-                                            'reply_markup':bot_admin_keyboard() if is_admin(chat_id) else None}); return
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,
+            'text':bot_admin_home_text() if is_admin(chat_id) else '⛔ Không có quyền admin.',
+            'reply_markup':bot_admin_keyboard() if is_admin(chat_id) else None}); return
+
+    if is_admin(chat_id) and text.startswith('/adduser '):
+        parts=text.split()
+        try:
+            if len(parts)!=3:raise ValueError()
+            uid=int(parts[1]);dur=parts[2];info=grant_timed_access(uid,dur,chat_id,False)
+            out=(f"✅ ĐÃ CẤP FULL USER\n{BOT_DIV}\nID: {uid}\nGói: VIP USER · tất cả chức năng thường\n"
+                 f"Hạn: {_fmt_remaining(info.get('remaining')) if info.get('expires_at') is not None else 'VĨNH VIỄN'}\nAdmin: KHÔNG")
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':out,'reply_markup':admin_user_keyboard(uid)});return
+        except:
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'Cú pháp: /adduser <ID> <1d|7d|30d|4w|forever>'});return
+    if is_admin(chat_id) and text.startswith('/extend '):
+        parts=text.split()
+        try:
+            if len(parts)!=3:raise ValueError()
+            uid=int(parts[1]);dur=parts[2];grant_timed_access(uid,dur,chat_id,True)
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':f'⏱ ĐÃ GIA HẠN {uid} · +{dur.upper()}\n'+permission_text(uid),'reply_markup':admin_user_keyboard(uid)});return
+        except:
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'Cú pháp: /extend <ID> <1d|7d|30d|4w>'});return
+    if is_admin(chat_id) and text.startswith('/lifetime '):
+        try:
+            uid=int(text.split(maxsplit=1)[1]);grant_timed_access(uid,'forever',chat_id,False)
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'♾ ĐÃ CẤP VĨNH VIỄN\n'+permission_text(uid),'reply_markup':admin_user_keyboard(uid)});return
+        except:
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'Cú pháp: /lifetime <ID>'});return
+    if is_admin(chat_id) and text.startswith('/userinfo '):
+        try:
+            uid=int(text.split(maxsplit=1)[1]);await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':permission_text(uid),'reply_markup':admin_user_keyboard(uid)});return
+        except:
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'Cú pháp: /userinfo <ID>'});return
 
     if is_admin(chat_id) and text.startswith('/grantvip '):
         try: uid=int(text.split(maxsplit=1)[1]); grant_access(uid,chat_id,True,'vip'); out=f'💎 VIP {uid}: mở full + GPT'
@@ -2590,18 +3137,17 @@ async def bot_handle_message(client,msg):
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':out}); return
     if is_admin(chat_id) and text.startswith('/users'):
         with sqlite3.connect(DB_PATH) as db:
-            rows=db.execute(
-                '''SELECT a.chat_id,a.enabled,COALESCE(p.can_predict,1),COALESCE(p.can_history,1),
-                          COALESCE(p.can_ai,1),COALESCE(p.can_auto,1),COALESCE(p.preset,'legacy')
-                   FROM bot_access a LEFT JOIN bot_permissions p ON p.chat_id=a.chat_id
-                   ORDER BY a.updated_at DESC LIMIT 100'''
-            ).fetchall()
-        def flag(v,ch): return ch if v else '·'
-        body='\n'.join(
-            f"{uid} · {'ON' if en else 'OFF'} · {preset.upper()} · {flag(p,'P')}{flag(h,'H')}{flag(ai,'G')}{flag(au,'A')}"
-            for uid,en,p,h,ai,au,preset in rows
-        ) if rows else 'Chưa có user.'
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':('👥 USERS · P/H/G/A\n'+body)[:4000]}); return
+            rows=db.execute("""SELECT a.chat_id,a.enabled,a.expires_at,a.access_label,COALESCE(p.preset,'legacy')
+                               FROM bot_access a LEFT JOIN bot_permissions p ON p.chat_id=a.chat_id
+                               ORDER BY a.updated_at DESC LIMIT 100""").fetchall()
+        lines=['👥 USERS · PREMIUM ACCESS',BOT_DIV];now=time.time()
+        for uid,en,exp,label,preset in rows:
+            active=bool(en) and (exp is None or float(exp)>now)
+            remain='∞' if exp is None and active else (_fmt_remaining(float(exp)-now) if exp else '---')
+            lines.append(f"{'🟢' if active else '🔴'} {uid} · {str(preset).upper()} · {label or '-'} · {remain}")
+        if len(lines)==2:lines.append('Chưa có user.')
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'\n'.join(lines)[:4000]});return
+
 
     if is_admin(chat_id) and text.startswith('/background'):
         mark_background_started(chat_id)
@@ -2625,10 +3171,27 @@ async def bot_handle_message(client,msg):
         b=text.split(maxsplit=1)[1].strip()
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':await admin_test_api(client,b)}); return
     if is_admin(chat_id) and text.startswith('/apis'):
-        lines=['🔗 API V33']
+        lines=['🔗 API V37']
         for b,c in BOARDS.items():
             ec=effective_cfg(b,c); lines.append(f"{b}\n→ {ec.get('current','-')}"+(f"\nH {ec.get('history')}" if ec.get('history') else ''))
         await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'\n'.join(lines)[:4000],'reply_markup':bot_admin_keyboard()}); return
+    if is_admin(chat_id) and text.startswith('/setsicboapi '):
+        parts=text.split(maxsplit=2)
+        if len(parts)!=3:
+            out='Cú pháp: /setsicboapi <current_url> <history_url>'
+        elif not parts[1].startswith(('http://','https://')) or not parts[2].startswith(('http://','https://')):
+            out='❌ Cả current_url và history_url phải bắt đầu bằng http:// hoặc https://'
+        else:
+            set_api_override('sunwin:sicbo',parts[1],parts[2])
+            out='✅ Đã đổi CURRENT + HISTORY cho SUNWIN SICBO'
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':out,'reply_markup':bot_admin_keyboard()}); return
+
+    if is_admin(chat_id) and text.startswith('/resetsicboapi'):
+        reset_api_override('sunwin:sicbo')
+        ec=effective_cfg('sunwin:sicbo',BOARDS['sunwin:sicbo'])
+        out='↩️ Đã trả SUNWIN SICBO về KWIN mặc định\\n'+ec.get('current','')+'\\n'+ec.get('history','')
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':out,'reply_markup':bot_admin_keyboard()}); return
+
     if is_admin(chat_id) and text.startswith('/setapi '):
         parts=text.split(maxsplit=3)
         if len(parts)<3 or parts[1] not in BOARDS: out='Cú pháp: /setapi <board> <current_url> [history_url]'
@@ -2651,14 +3214,11 @@ async def bot_handle_message(client,msg):
 
     if text.startswith('/start') or text.startswith('/games') or text.startswith('/menu'):
         if not has_access(chat_id):
-            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':f'🔒 Chưa được cấp quyền.\nUser ID: {chat_id}\nAdmin dùng /grant {chat_id} để mở BASIC.'}); return
-        bg_note=''
-        if text.startswith('/start') and is_admin(chat_id):
-            mark_background_started(chat_id)
-            bg_note='\n\n♾ Nền 24/7 đang chạy vĩnh viễn trên Railway; không cần /start lại.'
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,
-            'text':'🎛 TAIXIUTOOL V29 · GAME → BÀN → TÍNH NĂNG\nNút khóa = chưa được cấp quyền.'+bg_note,
-            'reply_markup':bot_games_keyboard(chat_id)}); return
+            await tg_call(client,'sendMessage',{'chat_id':chat_id,
+                'text':f'🔒 CHƯA ĐƯỢC CẤP QUYỀN\n{BOT_DIV}\nID: {chat_id}\nGửi ID này cho admin để mở quyền.'}); return
+        if text.startswith('/start') and is_admin(chat_id):mark_background_started(chat_id)
+        txt=('🎮 CHỌN GAME\n'+BOT_DIV+'\nChọn game để xem cầu, kết quả và prediction.') if text.startswith('/games') else bot_home_text(chat_id)
+        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':txt,'reply_markup':bot_games_keyboard(chat_id)}); return
 
 
     if not has_access(chat_id):
@@ -2709,105 +3269,116 @@ async def bot_handle_message(client,msg):
 
 
 async def bot_handle_callback(client,q):
-    qid=q.get('id'); data=q.get('data') or ''; msg=q.get('message') or {}; chat_id=(msg.get('chat') or {}).get('id')
-    if not chat_id: return
-    try: await tg_call(client,'answerCallbackQuery',{'callback_query_id':qid})
-    except: pass
+    qid=q.get('id');data=q.get('data') or '';msg=q.get('message') or {};chat_id=(msg.get('chat') or {}).get('id')
+    if not chat_id:return
+    try:await tg_call(client,'answerCallbackQuery',{'callback_query_id':qid})
+    except:pass
+
+    if data=='home':
+        if not has_access(chat_id):await tg_panel(client,q,f'🔒 Chưa được cấp quyền · ID {chat_id}');return
+        await tg_panel(client,q,bot_home_text(chat_id),bot_games_keyboard(chat_id));return
+    if data=='adminhome':
+        if not is_admin(chat_id):await tg_panel(client,q,'⛔ Không có quyền admin.');return
+        await tg_panel(client,q,bot_admin_home_text(),bot_admin_keyboard());return
+    if data.startswith(('uinfo|','uadd|','ulife|','ulock|')):
+        if not is_admin(chat_id):await tg_panel(client,q,'⛔ Không có quyền admin.');return
+        parts=data.split('|');act=parts[0]
+        try:uid=int(parts[1])
+        except:
+            await tg_panel(client,q,'❌ User ID không hợp lệ.',bot_admin_keyboard());return
+        if act=='uadd':
+            dur=parts[2] if len(parts)>2 else '1d';grant_timed_access(uid,dur,chat_id,True);txt=f"✅ ĐÃ GIA HẠN +{dur.upper()}\n"+permission_text(uid)
+        elif act=='ulife':grant_timed_access(uid,'forever',chat_id,False);txt='♾ ĐÃ CẤP VĨNH VIỄN\n'+permission_text(uid)
+        elif act=='ulock':grant_access(uid,chat_id,False);txt='🔒 ĐÃ KHÓA USER\n'+permission_text(uid)
+        else:txt=permission_text(uid)
+        await tg_panel(client,q,txt,admin_user_keyboard(uid));return
+
 
     if data.startswith('adm|'):
-        if not is_admin(chat_id):
-            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'⛔ Không có quyền admin.'}); return
+        if not is_admin(chat_id):await tg_panel(client,q,'⛔ Không có quyền admin.');return
         act=data.split('|',1)[1]
-        if act=='health': txt=admin_health_text()
-        elif act=='stats': txt=admin_stats_text()
-        elif act=='background': txt=background_status_text() 
-        elif act=='apis': txt='🔗 Dùng /apis để xem URL hoặc /testapi <board>.'
+        if act=='health':txt=admin_health_text()
+        elif act=='stats':txt=admin_stats_text()
+        elif act=='background':txt=background_status_text()
+        elif act=='apis':txt='🔗 API LINKS\n'+BOT_DIV+'\nDùng /apis để xem URL hoặc /testapi <board>.'
+        elif act=='sicboapi':
+            ec=effective_cfg('sunwin:sicbo',BOARDS['sunwin:sicbo'])
+            txt=('🎲 SUNWIN SICBO · API MANAGER\n'+BOT_DIV+
+                 f"\nCURRENT:\n{ec.get('current','-')}\n\nHISTORY:\n{ec.get('history','-')}"+
+                 '\n\nĐổi nhanh:\n/setsicboapi <current_url> <history_url>\n/resetsicboapi')
         elif act=='engine':
-            b=get_selected_board(chat_id); txt=engine_diag_text(b) if b else 'Chọn bàn trước hoặc dùng /engine <board>.'
+            b=get_selected_board(chat_id);txt=engine_diag_text(b) if b else '🧠 Chọn bàn trước rồi mở ENGINE.'
         elif act=='deep':
-            b=get_selected_board(chat_id); txt=deep_local_text(b) if b else 'Chọn bàn trước hoặc dùng /deep <board>.'
-        else:
-            txt=('🔐 QUYỀN NHANH\n/grant ID = BASIC\n/grantpro ID = PRO\n/grantvip ID = VIP\n'
-                 '/permit ID ai|history|auto|predict\n/deny ID <feature>\n'
-                 '/lock ID · /unlock ID basic|pro|vip\n/perms ID')
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':txt,'reply_markup':bot_admin_keyboard()}); return
+            b=get_selected_board(chat_id);txt=deep_local_text(b) if b else '🧮 Chọn bàn trước rồi mở DEEP.'
+        else:txt=admin_help()
+        await tg_panel(client,q,txt,bot_admin_keyboard());return
 
+    if data=='account':
+        await tg_panel(client,q,bot_account_text(chat_id),bot_games_keyboard(chat_id));return
     if data=='perm':
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':permission_text(chat_id),
-                                            'reply_markup':bot_games_keyboard(chat_id) if has_access(chat_id) else None}); return
+        await tg_panel(client,q,permission_text(chat_id),bot_games_keyboard(chat_id) if has_access(chat_id) else None);return
     if data=='help':
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':user_help(chat_id),
-                                            'reply_markup':bot_games_keyboard(chat_id) if has_access(chat_id) else None}); return
+        await tg_panel(client,q,user_help(chat_id),bot_games_keyboard(chat_id) if has_access(chat_id) else None);return
 
     if not has_access(chat_id):
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':f'🔒 Chưa được cấp quyền. User ID: {chat_id}'}); return
-
+        await tg_panel(client,q,f'🔒 Chưa được cấp quyền · ID {chat_id}');return
     if data=='games':
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'🎮 Chọn game:','reply_markup':bot_games_keyboard(chat_id)}); return
+        await tg_panel(client,q,'🎮 CHỌN GAME\n'+BOT_DIV+'\nChọn game để mở dashboard.',bot_games_keyboard(chat_id));return
     if data.startswith('game|'):
         game=data.split('|',1)[1]
-        if not boards_for_game(game):
-            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'Game chưa có bàn dữ liệu.'}); return
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':game_cau_overview(game),
-                                            'reply_markup':bot_game_keyboard(game,chat_id)}); return
-
+        if not boards_for_game(game):await tg_panel(client,q,'Game chưa có bàn dữ liệu.',bot_games_keyboard(chat_id));return
+        await tg_panel(client,q,bot_game_text(game,chat_id),bot_game_keyboard(game,chat_id));return
     if data=='histall':
-        if not feature_allowed(chat_id,'history'):
-            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':locked_text(chat_id,'history')}); return
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':format_all_history(),
-                                            'reply_markup':bot_games_keyboard(chat_id)}); return
-
+        if not feature_allowed(chat_id,'history'):await tg_panel(client,q,locked_text(chat_id,'history'),bot_games_keyboard(chat_id));return
+        await tg_panel(client,q,format_all_history(),bot_games_keyboard(chat_id));return
     if data in ('allon','alloff'):
-        if not feature_allowed(chat_id,'auto'):
-            await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':locked_text(chat_id,'auto')}); return
+        if not feature_allowed(chat_id,'auto'):await tg_panel(client,q,locked_text(chat_id,'auto'),bot_games_keyboard(chat_id));return
         on=data=='allon'
-        for b in available_bot_boards(): set_sub(chat_id,b,on)
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':'✅ AUTO ALL đã bật.' if on else '⛔ AUTO ALL đã tắt.',
-                                            'reply_markup':bot_games_keyboard(chat_id)}); return
-
+        for b in available_bot_boards():set_sub(chat_id,b,on)
+        await tg_panel(client,q,('🔔 AUTO ALL · ĐÃ BẬT\n' if on else '🔕 AUTO ALL · ĐÃ TẮT\n')+BOT_DIV+'\n'+bot_home_text(chat_id),bot_games_keyboard(chat_id));return
     if data.startswith('locked|'):
-        parts=data.split('|',2); feat=parts[1] if len(parts)>1 else 'predict'
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':locked_text(chat_id,feat)}); return
+        parts=data.split('|',2);feat=parts[1] if len(parts)>1 else 'predict';board=parts[2] if len(parts)>2 else get_selected_board(chat_id)
+        await tg_panel(client,q,locked_text(chat_id,feat),bot_board_keyboard(board,chat_id) if board else bot_games_keyboard(chat_id));return
 
-    if '|' not in data: return
+    if '|' not in data:return
     action,board=data.split('|',1)
-    if board not in available_bot_boards(): return
-
-    if action=='sel':
-        set_selected_board(chat_id,board)
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,
-            'text':f"🎮 {board_label(board)}\n"+format_prediction(board,get_shared_prediction(board)),
-            'reply_markup':bot_board_keyboard(board,chat_id)}); return
-
+    if board not in available_bot_boards():return
     set_selected_board(chat_id,board)
     feat={'now':'predict','hist':'history','rounds':'history','ai':'ai','auto':'auto','on':'auto','off':'auto'}.get(action)
     if feat and not feature_allowed(chat_id,feat):
-        await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':locked_text(chat_id,feat),
-                                            'reply_markup':bot_board_keyboard(board,chat_id)}); return
+        await tg_panel(client,q,locked_text(chat_id,feat),bot_board_keyboard(board,chat_id));return
 
-    if action=='auto':
-        on=not sub_enabled(chat_id,board); set_sub(chat_id,board,on)
-        txt=('🔔 AUTO ON · ' if on else '🔕 AUTO OFF · ')+board_label(board)
-    elif action=='on':
-        set_sub(chat_id,board,True); txt='🔔 AUTO ON · '+board_label(board)
-    elif action=='off':
-        set_sub(chat_id,board,False); txt='🔕 AUTO OFF · '+board_label(board)
-    elif action=='now':
-        txt=format_prediction(board,get_shared_prediction(board))
-    elif action=='ai':
-        txt=await ai_explain_board(client,board)
-    elif action=='hist':
-        txt=format_history(board)
-    elif action=='rounds':
-        txt=format_round_history(board,15)
-    else:
-        return
-    await tg_call(client,'sendMessage',{'chat_id':chat_id,'text':txt,'reply_markup':bot_board_keyboard(board,chat_id)})
+    if action in ('sel','now'):txt=format_prediction(board,get_shared_prediction(board))
+    elif action=='auto':
+        on=not sub_enabled(chat_id,board);set_sub(chat_id,board,on)
+        txt=('🔔 AUTO · ĐÃ BẬT\n' if on else '🔕 AUTO · ĐÃ TẮT\n')+BOT_DIV+'\n'+format_prediction(board,get_shared_prediction(board))
+    elif action=='on':set_sub(chat_id,board,True);txt='🔔 AUTO · ĐÃ BẬT\n'+BOT_DIV+'\n'+format_prediction(board,get_shared_prediction(board))
+    elif action=='off':set_sub(chat_id,board,False);txt='🔕 AUTO · ĐÃ TẮT\n'+BOT_DIV+'\n'+format_prediction(board,get_shared_prediction(board))
+    elif action=='hist':txt=format_history(board)
+    elif action=='rounds':txt=format_round_history(board,15)
+    elif action=='cau':txt=bot_cau_text(board,24)
+    elif action=='ai':txt=await ai_explain_board(client,board)
+    elif action=='diag':txt=engine_diag_text(board) if is_admin(chat_id) else '⛔ Chỉ admin xem ENGINE DIAG.'
+    else:return
+    await tg_panel(client,q,txt,bot_board_keyboard(board,chat_id))
 
 
 async def telegram_loop():
     offset=0
     async with httpx.AsyncClient() as client:
+        try:
+            await tg_call(client,'setMyCommands',{'commands':[
+                {'command':'start','description':'Mở bảng điều khiển'},
+                {'command':'games','description':'Chọn game / bàn'},
+                {'command':'status','description':'Dự đoán hiện tại'},
+                {'command':'history','description':'Lịch sử đúng / sai'},
+                {'command':'results','description':'Kết quả game'},
+                {'command':'historyall','description':'Lịch sử tất cả game'},
+                {'command':'auto','description':'Bật / tắt AUTO'},
+                {'command':'ai','description':'GPT phân tích'},
+                {'command':'me','description':'Quyền tài khoản'}
+            ]})
+        except:pass
         try: await tg_call(client,'deleteWebhook',{'drop_pending_updates':False})
         except: pass
         while True:
@@ -2836,12 +3407,12 @@ async def lifespan(app: FastAPI):
             try: await task
             except BaseException: pass
 
-app=FastAPI(title='TAIXIUTOOL V33 History Cau Pro API', lifespan=lifespan)
+app=FastAPI(title='TAIXIUTOOL V37 Sicbo Kwin Meta API', lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_credentials=False,allow_methods=['GET'],allow_headers=['*'])
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'admin_count':len(ADMIN_IDS),'max_history':MAX_HISTORY,'chatgpt_enabled':bool(OPENAI_API_KEY and OPENAI_MODEL),'engine':'CHAMPION 15 STRATEGY + FUSION V33','background':background_status_payload(),'sync_version':'V33_HISTORY_CAU'}
+    return {'ok':True,'worker_last_cycle':_last_cycle,'poll_seconds':POLL_SECONDS,'db':DB_PATH,'bot_enabled':bool(BOT_TOKEN),'admin_count':len(ADMIN_IDS),'max_history':MAX_HISTORY,'chatgpt_enabled':bool(OPENAI_API_KEY and OPENAI_MODEL),'engine':'BOARD-META 18 + SICBO HASH META V37','background':background_status_payload(),'sync_version':'V37_SICBO_KWIN_META'}
 
 @app.get('/api/learn/{game}/{table}')
 def learn(game:str, table:str, limit:int=Query(1000,ge=20,le=1000), sub:str|None=None):
@@ -2893,7 +3464,7 @@ def api_sync_all(limit:int=Query(80,ge=20,le=240)):
         boards[board]={'rows':rows,'model':model,'state':state,
                        'shared_prediction':get_shared_prediction(board),
                        'prediction_history':get_prediction_history(board,40)}
-    return {'ok':True,'server_time':time.time(),'engine':'CHAMPION 15 STRATEGY + FUSION V33',
+    return {'ok':True,'server_time':time.time(),'engine':'BOARD-META 18 + SICBO HASH META V37',
             'poll_seconds':POLL_SECONDS,'source_of_truth':'railway',
             'sync_id':int(_last_cycle*1000) if _last_cycle else 0,
             'boards':boards,'background':background_status_payload()}
@@ -2955,11 +3526,11 @@ def history_api(game:str,table:str,limit:int=Query(100,ge=1,le=1000)):
 
 @app.get('/')
 def index():
-    return FileResponse(BASE_DIR/'index.html',media_type='text/html')
+    return {'ok':True,'service':'TAIXIUTOOL V37 SICBO KWIN META','mode':'telegram-bot-only',
+            'worker':'24/7','bot_enabled':bool(BOT_TOKEN),'boards':len(available_bot_boards()),
+            'engine':'BOARD-META 18 + SICBO HASH META V37'}
 
 @app.get('/{path:path}')
-def static_fallback(path:str):
-    p=(BASE_DIR/path).resolve()
-    if p.is_file() and BASE_DIR in p.parents:
-        return FileResponse(p)
-    return FileResponse(BASE_DIR/'index.html',media_type='text/html')
+def no_web_fallback(path:str):
+    return JSONResponse({'ok':False,'mode':'telegram-bot-only',
+                         'message':'Web UI đã tắt. Dùng Telegram bot hoặc endpoint /api/*.'},status_code=404)
