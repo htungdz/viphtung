@@ -64,6 +64,10 @@ _last_cycle = 0.0
 _process_started_at = time.time()
 _ml_cache = {}
 _group_spam_state = {}
+_hash_fast_cache = {}
+_hash_fast_cache_order = []
+_state_model_cache = {}
+_fast_board_anchor = {}
 
 
 def ensure_db():
@@ -882,7 +886,7 @@ def model_snapshot(rows, game=None, board=None):
     if len(seq)<6:
         return {'sample':len(seq),'score':0.0,'prediction':None,'confidence':50,'percent':50,
                 'pattern':'ĐANG HỌC','alt':'Chưa đủ mẫu','entropy':round(_entropy(seq),4),
-                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'BOARD-META 55 + HASH-16 ENSEMBLE V51',
+                'cycle':{'k':0,'r':0.0},'agreement':0.5,'engine':'BOARD-META 55 + HASH-24 FAST ENSEMBLE V52',
                 'skills':0,'totalSkills':60,'ml':{'ready':False},'updated_at':time.time()}
     vote=lambda x: 1 if x=='TÀI' else -1
     n=len(seq); comps=[]
@@ -1128,7 +1132,7 @@ def model_snapshot(rows, game=None, board=None):
     return {'sample':n,'score':round(score,4),'prediction':pred,'confidence':conf,'percent':conf,
             'run':run,'pattern':pattern,'alt':alt,'entropy':round(H,4),
             'cycle':{'k':lag,'r':round(best,4)},'agreement':round(agreement,4),
-            'engine':'BOARD-META 55 + HASH-16 ENSEMBLE V51','skills':len(active),'totalSkills':60,
+            'engine':'BOARD-META 55 + HASH-24 FAST ENSEMBLE V52','skills':len(active),'totalSkills':60,
             'ml':ml,'top_signals':top_signals,'updated_at':time.time()}
 
 # V32: V31 fusion becomes one candidate strategy instead of the only final decider.
@@ -3151,7 +3155,7 @@ def model_snapshot(rows, game=None, board=None):
       'wf_floor':round(wf_floor,4),'regime_quality':round(reg_q,4),
       'signal_calibration':calibration,
       'reference_pattern':_reference_pattern_signal(seq) if _reference_allowed(board) else None,
-      'engine':'BOARD-META 55 + HASH-16 ENSEMBLE V51','totalStrategies':len(STRATEGY_NAMES),'updated_at':time.time()})
+      'engine':'BOARD-META 55 + HASH-24 FAST ENSEMBLE V52','totalStrategies':len(STRATEGY_NAMES),'updated_at':time.time()})
     return fusion
 
 
@@ -3277,37 +3281,29 @@ def _drop_stale_pending(board,target_session):
 
 
 def _create_shared_prediction(board, rows, current_session=None):
-    if not rows: return None,False
-    game=board.split(':',1)[0]
-    model=model_snapshot(rows,game,board)
-    if board=='sunwin:sicbo':
-        model['dice_forecast']=dice_position_forecast(rows)
-    if board=='lc79:xocdia' and model.get('prediction'):
-        model['xocdia_forecast']=xocdia_detail_forecast(rows,model['prediction'])
-    if not model.get('prediction'): return None,False
+    if not rows:return None,False
     latest=str(current_session) if current_session is not None else None
     session=str(_session_num(latest)+1) if latest is not None and _session_num(latest) is not None else _next_session(rows)
-    if not session: return None,False
-    if latest is None: latest=str(int(session)-1)
+    if not session:return None,False
+    if latest is None:latest=str(int(session)-1)
     _drop_stale_pending(board,session)
     with sqlite3.connect(DB_PATH) as db:
-        db.execute('''INSERT INTO board_cursor(board,last_completed_session,updated_at) VALUES(?,?,?)
-                      ON CONFLICT(board) DO UPDATE SET last_completed_session=excluded.last_completed_session,
-                      updated_at=excluded.updated_at''',(board,latest,time.time())); db.commit()
-    with sqlite3.connect(DB_PATH) as db:
         old=db.execute('SELECT prediction,confidence,score,model_json,created_at,actual,ok,settled_at FROM shared_predictions WHERE board=? AND session=?',(board,session)).fetchone()
-        if old:
-            try: mj=json.loads(old[3]) if old[3] else {}
-            except: mj={}
-            return {'session':session,'prediction':old[0],'confidence':old[1],'score':old[2],'model':mj,'created_at':old[4],
-                    'actual':old[5],'ok':None if old[6] is None else bool(old[6]),'settled_at':old[7]},False
-        now=time.time()
-        db.execute('''INSERT INTO shared_predictions(board,session,prediction,confidence,score,model_json,created_at)
-                      VALUES(?,?,?,?,?,?,?)''',(board,session,model['prediction'],model['confidence'],model['score'],json.dumps(model,ensure_ascii=False),now))
-        db.commit()
+    if old:
+        try:mj=json.loads(old[3]) if old[3] else {}
+        except:mj={}
+        if mj:_state_model_cache[board]=mj
+        return {'session':session,'prediction':old[0],'confidence':old[1],'score':old[2],'model':mj,'created_at':old[4],'actual':old[5],'ok':None if old[6] is None else bool(old[6]),'settled_at':old[7]},False
+    game=board.split(':',1)[0];model=model_snapshot(rows,game,board)
+    if board=='sunwin:sicbo':model['dice_forecast']=dice_position_forecast(rows)
+    if board=='lc79:xocdia' and model.get('prediction'):model['xocdia_forecast']=xocdia_detail_forecast(rows,model['prediction'])
+    if not model.get('prediction'):return None,False
+    _state_model_cache[board]=model
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute("INSERT INTO board_cursor(board,last_completed_session,updated_at) VALUES(?,?,?) ON CONFLICT(board) DO UPDATE SET last_completed_session=excluded.last_completed_session,updated_at=excluded.updated_at",(board,latest,time.time()))
+        now=time.time();db.execute("INSERT OR IGNORE INTO shared_predictions(board,session,prediction,confidence,score,model_json,created_at) VALUES(?,?,?,?,?,?,?)",(board,session,model['prediction'],model['confidence'],model['score'],json.dumps(model,ensure_ascii=False),now));db.commit()
     log_strategy_predictions(board,session,model)
-    return {'session':session,'prediction':model['prediction'],'confidence':model['confidence'],'score':model['score'],
-            'model':model,'created_at':now,'actual':None,'ok':None,'settled_at':None},True
+    return {'session':session,'prediction':model['prediction'],'confidence':model['confidence'],'score':model['score'],'model':model,'created_at':now,'actual':None,'ok':None,'settled_at':None},True
 
 
 async def refresh_shared_prediction(board,current_session=None):
@@ -3323,15 +3319,14 @@ async def refresh_shared_prediction(board,current_session=None):
 
 
 async def set_state(board, ok, error=None):
-    rows=load_rows(board,500)
-    model=model_snapshot(rows, board.split(':',1)[0], board)
+    model=_state_model_cache.get(board)
+    if model is None:
+        rows=load_rows(board,500)
+        model=model_snapshot(rows,board.split(':',1)[0],board) if rows else {'engine':'BOARD-META 55 + HASH-24 FAST ENSEMBLE V52'}
+        _state_model_cache[board]=model
     async with _db_lock:
         with sqlite3.connect(DB_PATH) as db:
-            db.execute('''INSERT INTO board_state(board,updated_at,source_ok,last_error,model_json)
-                          VALUES(?,?,?,?,?) ON CONFLICT(board) DO UPDATE SET updated_at=excluded.updated_at,
-                          source_ok=excluded.source_ok,last_error=excluded.last_error,model_json=excluded.model_json''',
-                       (board,time.time(),1 if ok else 0,error,json.dumps(model,ensure_ascii=False)))
-            db.commit()
+            db.execute("INSERT INTO board_state(board,updated_at,source_ok,last_error,model_json) VALUES(?,?,?,?,?) ON CONFLICT(board) DO UPDATE SET updated_at=excluded.updated_at,source_ok=excluded.source_ok,last_error=excluded.last_error,model_json=excluded.model_json",(board,time.time(),1 if ok else 0,error,json.dumps(model,ensure_ascii=False)));db.commit()
 
 
 def effective_cfg(board, cfg):
@@ -4981,7 +4976,7 @@ def build_timeout_report(run):
     report={'type':'ONGCHUNHACAI_AUTO_TRAIN_2H_REPORT','version':'V28','run_id':run['id'],
             'admin_chat_id':run['admin_chat_id'],'started_at':start,'ends_at':end,
             'duration_seconds':int(end-start),'generated_at':time.time(),
-            'engine':'BOARD-META 55 + HASH-16 ENSEMBLE V51','boards':{},
+            'engine':'BOARD-META 55 + HASH-24 FAST ENSEMBLE V52','boards':{},
             'totals':{'boards':0,'new_rounds':0,'predictions':0,'settled':0,'wins':0,'losses':0,'pending':0}}
     for board in available_bot_boards():
         rows=load_rows(board,MAX_HISTORY);before=set(str(x) for x in snapshot.get(board,[]))
@@ -5709,7 +5704,7 @@ def _v49_send_payload(chat_id,text,reply_markup=None):
 
 
 # ============================================================================
-# V51 HASH ULTRA AUTO-DETECT LAYER
+# V52 FAST ULTRA AUTO-DETECT LAYER
 # ============================================================================
 def ensure_hash_tables():
     with sqlite3.connect(DB_PATH) as db:
@@ -5749,7 +5744,10 @@ def _clip(v,lo,hi):return max(lo,min(hi,float(v)))
 def _prob_from_total(total):return _clip(0.5+(float(total)-10.5)/15.0*0.34,0.34,0.66)
 
 def hash_ultra_predict(hash_hex):
-    z=hash_hex.lower();L=len(z);kind='MD5' if L==32 else 'SHA256'
+    z=(hash_hex or '').lower()
+    cached=_hash_fast_cache.get(z)
+    if cached is not None:return dict(cached)
+    L=len(z);kind='MD5' if L==32 else 'SHA256'
     n=int(z,16);nibs=[int(c,16) for c in z];bs=bytes.fromhex(z);models=[]
     def add(name,p,w):models.append((name,_clip(p,0.18,0.82),float(w)))
     d1=((n>>0)%6)+1;d2=((n>>8)%6)+1;d3=((n>>16)%6)+1
@@ -5783,27 +5781,41 @@ def hash_ultra_predict(hash_hex):
     xorv=0
     for b in bs:xorv^=b
     add('XOR_FOLD',0.5+(xorv-127.5)/255*0.22,0.72)
+    edge=(sum(nibs[:L//4])-sum(nibs[-L//4:]))/max(1,L//4)
+    add('PREFIX_SUFFIX',0.5+math.tanh(edge/5.0)*0.12,0.76)
+    qlen=max(1,L//4);qmeans=[]
+    for i in range(4):
+        q=nibs[i*qlen:(i+1)*qlen] if i<3 else nibs[i*qlen:]
+        if q:qmeans.append(sum(q)/len(q))
+    qscore=sum(1 if x>=7.5 else -1 for x in qmeans)/max(1,len(qmeans));add('QUARTILE_VOTE',0.5+qscore*0.10,0.86)
+    rises=sum(nibs[i]>nibs[i-1] for i in range(1,L));falls=sum(nibs[i]<nibs[i-1] for i in range(1,L));add('NIBBLE_FLOW',0.5+((rises-falls)/max(1,L-1))*0.15,0.74)
+    byte_even=sum((b&1)==0 for b in bs);add('BYTE_PARITY',0.5+((byte_even/len(bs))-.5)*0.28,0.72)
+    adjxor=[bs[i]^bs[i-1] for i in range(1,len(bs))];axmean=sum(adjxor)/max(1,len(adjxor));add('ADJ_XOR',0.5+(axmean-127.5)/255*0.20,0.70)
+    edgefold=(int(z[:8],16)^int(z[-8:],16))&0xffffffff;add('EDGE_FOLD',0.5+((edgefold/0xffffffff)-0.5)*0.22,0.73)
+    runs=1+sum(z[i]!=z[i-1] for i in range(1,L));run_ratio=runs/L;add('HEX_RUNS',0.5+(run_ratio-0.82)*0.28,0.64)
+    b2=hashlib.blake2s(z.encode(),digest_size=16).digest();b2mean=sum(b2)/len(b2);add('BLAKE2S_DEEP',0.5+(b2mean-127.5)/255*0.18,0.88)
     derived=hashlib.sha256(z.encode()).hexdigest();dn=[int(c,16) for c in derived];dmean=sum(dn)/len(dn);dedge=(int(derived[:8],16)^int(derived[-8:],16))&0xffffffff
     add('SHA_DEEP',0.5+(dmean-7.5)/15*0.20+((dedge/0xffffffff)-0.5)*0.10,1.05)
     ent=_hex_entropy(z);ent_norm=_clip(ent/4.0,0,1);unique=len(set(z))/16.0
-    repeated=sum(1 for c in set(z) if z.count(c)>max(2,L//12))/max(1,len(set(z)))
+    counts={c:z.count(c) for c in set(z)};repeated=sum(1 for v in counts.values() if v>max(2,L//12))/max(1,len(counts))
     quality=_clip(0.50+0.34*ent_norm+0.16*_clip(unique,0,1)-0.12*repeated,0.45,1.0)
-    tw=sum(w for _,_,w in models);rawp=sum(p*w for _,p,w in models)/tw
-    sign_tai=sum(w for _,p,w in models if p>=0.5)/tw
-    # Blend magnitude-vote with direction-vote so one extreme heuristic cannot dominate the verdict.
-    fused=0.68*rawp+0.32*sign_tai;direction=1 if fused>=0.5 else 0
-    agree=sign_tai if direction else (1-sign_tai)
-    # Convert ensemble agreement into a calibrated signal percentage, not a claimed win probability.
-    strength=50.0 + max(0.0,agree-0.5)*30.0 + abs(fused-0.5)*115.0
-    strength += max(-2.0,min(2.0,(quality-0.75)*8.0))
-    if agree<0.56:strength=min(strength,56.5)
-    strength=_clip(strength,51.2,70.0)
+    tw=sum(w for _,_,w in models);rawp=sum(p*w for _,p,w in models)/tw;sign_tai=sum(w for _,p,w in models if p>=0.5)/tw
+    fused=0.66*rawp+0.34*sign_tai;direction=1 if fused>=0.5 else 0;agree=sign_tai if direction else (1-sign_tai)
+    strength=50.0+max(0.0,agree-0.5)*30.0+abs(fused-0.5)*110.0+max(-2.0,min(2.0,(quality-0.75)*8.0))
+    if agree<0.54:strength=min(strength,54.5)
+    elif agree<0.58:strength=min(strength,58.5)
+    if ent_norm<0.78:strength=min(strength,58.0)
+    strength=_clip(strength,51.0,70.0)
     tai=strength if direction else 100.0-strength;tai=round(tai,2);xiu=round(100-tai,2);pred='TÀI' if direction else 'XỈU';strength=max(tai,xiu)
     level='MẠNH' if strength>=66 else 'KHÁ' if strength>=59 else 'NHẸ'
-    return {'type':kind,'prediction':pred,'tai_pct':tai,'xiu_pct':xiu,'agreement':round(agree*100,1),'entropy':round(ent,3),'level':level,'models':len(models),'dice':(d1,d2,d3),'dice_total':d1+d2+d3}
+    result={'type':kind,'prediction':pred,'tai_pct':tai,'xiu_pct':xiu,'agreement':round(agree*100,1),'entropy':round(ent,3),'level':level,'models':len(models),'dice':(d1,d2,d3),'dice_total':d1+d2+d3}
+    _hash_fast_cache[z]=dict(result);_hash_fast_cache_order.append(z)
+    if len(_hash_fast_cache_order)>2048:
+        old=_hash_fast_cache_order.pop(0);_hash_fast_cache.pop(old,None)
+    return result
 
-def format_hash_prediction(hash_hex):
-    r=hash_ultra_predict(hash_hex)
+def format_hash_prediction(hash_hex,result=None):
+    r=result or hash_ultra_predict(hash_hex)
     return (f"<b>🔐 {r['type']}</b>\nTÀI <b>{r['tai_pct']:.2f}%</b>  •  XỈU <b>{r['xiu_pct']:.2f}%</b>\n🎯 <b>{r['prediction']} · {r['level']}</b>\n<i>{r['models']} tín hiệu · đồng thuận {r['agreement']:.1f}%</i>")
 
 def record_hash_analysis(chat_id,user_id,chat_type,hash_hex,result):
@@ -5869,7 +5881,7 @@ async def bot_handle_message(client,msg):
         if cmd=='/start':
             register_group_actor(msg,'/start group');await tg_call(client,'sendMessage',_v49_send_payload(chat_id,f"<b>💯 {BOT_NAME}</b>\n<i>Đã hoạt động trong nhóm.</i>\n{BOT_DIV}\nGửi trực tiếp <b>MD5 32 HEX</b> hoặc <b>SHA256 64 HEX</b>."));return
         if hkind:
-            register_group_actor(msg,'hash '+hkind);result=hash_ultra_predict(hval);record_hash_analysis(chat_id,actor,ctype,hval,result);await tg_call(client,'sendMessage',_v49_send_payload(chat_id,format_hash_prediction(hval)));return
+            result=hash_ultra_predict(hval);await tg_call(client,'sendMessage',_v49_send_payload(chat_id,format_hash_prediction(hval,result)));asyncio.create_task(asyncio.to_thread(register_group_actor,msg,'hash '+hkind));asyncio.create_task(asyncio.to_thread(record_hash_analysis,chat_id,actor,ctype,hval,result));return
         return
     new=register_bot_user(msg)
     if new:
@@ -5879,7 +5891,7 @@ async def bot_handle_message(client,msg):
             except:pass
     if hkind:
         if not has_access(chat_id) and not is_admin(actor):return
-        result=hash_ultra_predict(hval);record_hash_analysis(chat_id,actor,ctype,hval,result);await tg_call(client,'sendMessage',_v49_send_payload(chat_id,format_hash_prediction(hval)));return
+        result=hash_ultra_predict(hval);await tg_call(client,'sendMessage',_v49_send_payload(chat_id,format_hash_prediction(hval,result)));asyncio.create_task(asyncio.to_thread(record_hash_analysis,chat_id,actor,ctype,hval,result));return
     if _looks_like_hash_attempt(text):return
     if is_admin(actor) and cmd in ('/quantri','/admin'):
         await tg_call(client,'sendMessage',_v49_send_payload(chat_id,bot_admin_home_text(),bot_admin_keyboard()));return
@@ -6049,7 +6061,7 @@ async def lifespan(app: FastAPI):
             try: await task
             except BaseException: pass
 
-app=FastAPI(title='ONGCHUNHACAI V51 Hash Ultra Auto Group API', lifespan=lifespan)
+app=FastAPI(title='ONGCHUNHACAI V52 Fast Ultra API', lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_credentials=False,allow_methods=['GET'],allow_headers=['*'])
 
 @app.get('/api/health')
@@ -6059,7 +6071,7 @@ def health():
             'persistent_volume':str(DB_PATH).startswith('/data/'),'bot_enabled':bool(BOT_TOKEN),'admin_count':len(ADMIN_IDS),
             'max_history':MAX_HISTORY,'games_online':sum(1 for g in games if game_operational(g)),
             'games_total':len(games),'chatgpt_enabled':bool(OPENAI_API_KEY and OPENAI_MODEL),
-            'engine':'BOARD-META 55 + HASH-16 ENSEMBLE V51','background':background_status_payload(),'sync_version':'V51_HASH_ULTRA_AUTO_GROUP'}
+            'engine':'BOARD-META 55 + HASH-24 FAST ENSEMBLE V52','background':background_status_payload(),'sync_version':'V52_FAST_ULTRA'}
 
 @app.get('/api/learn/{game}/{table}')
 def learn(game:str, table:str, limit:int=Query(1000,ge=20,le=1000), sub:str|None=None):
@@ -6113,7 +6125,7 @@ def api_sync_all(limit:int=Query(80,ge=20,le=240)):
         boards[board]={'rows':rows,'model':model,'state':state,
                        'shared_prediction':get_shared_prediction(board),
                        'prediction_history':get_prediction_history(board,40)}
-    return {'ok':True,'server_time':time.time(),'engine':'BOARD-META 55 + HASH-16 ENSEMBLE V51',
+    return {'ok':True,'server_time':time.time(),'engine':'BOARD-META 55 + HASH-24 FAST ENSEMBLE V52',
             'poll_seconds':POLL_SECONDS,'source_of_truth':'railway',
             'sync_id':int(_last_cycle*1000) if _last_cycle else 0,
             'boards':boards,'background':background_status_payload()}
@@ -6185,7 +6197,7 @@ def history_api(game:str,table:str,limit:int=Query(100,ge=1,le=1000)):
 def index():
     return {'ok':True,'service':'ONGCHUNHACAI V43 COMPACT PRO · FUSION MAX GROUP BACCARAT','mode':'telegram-bot-only',
             'worker':'24/7','bot_enabled':bool(BOT_TOKEN),'boards':len(available_bot_boards()),
-            'engine':'BOARD-META 55 + HASH-16 ENSEMBLE V51'}
+            'engine':'BOARD-META 55 + HASH-24 FAST ENSEMBLE V52'}
 
 @app.get('/{path:path}')
 def no_web_fallback(path:str):
